@@ -1,0 +1,68 @@
+name: Release artifacts
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Git tag for an existing GitHub release
+        required: true
+
+jobs:
+  linux-x86_64:
+    name: Build Linux x86_64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      BIN: stow
+      TARGET: x86_64-unknown-linux-musl
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package artifact
+        id: package
+        shell: bash
+        run: |
+          tag="${{ github.event.release.tag_name || inputs.tag }}"
+          version="${tag#stow-v}"
+          archive="${BIN}-${version}-${TARGET}.tar.gz"
+
+          mkdir -p dist/pkg
+          cp "target/${TARGET}/release/${BIN}" dist/pkg/
+          tar -C dist/pkg -czf "dist/${archive}" "${BIN}"
+          sha256sum "dist/${archive}" > "dist/${archive}.sha256"
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.archive }}
+          path: |
+            dist/${{ steps.package.outputs.archive }}
+            dist/${{ steps.package.outputs.archive }}.sha256
+
+      - name: Upload release artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.package.outputs.tag }}" \
+            "dist/${{ steps.package.outputs.archive }}" \
+            "dist/${{ steps.package.outputs.archive }}.sha256" \
+            --clobber
