@@ -13,16 +13,6 @@ The usual workflow is:
 
 In OTF-style terms, `stow` treats services as code: declarative service descriptors, desired-state reconciliation, immutable digest-pinned artifacts, versioned configuration, auditable approvals, convergence status, and boring rollback behavior in a small single-binary tool.
 
-## releases
-
-Releases are managed by [release-plz](https://release-plz.dev/).
-
-- Use Conventional Commits for changes that should appear in the changelog, for example `fix:`, `feat:`, and `feat!:` for breaking changes.
-- Treat `Cargo.toml` as the version source of truth; `flake.nix` reads the package version from it.
-- Let release-plz update `Cargo.toml` and `CHANGELOG.md` in its release PR.
-- Merge the release-plz PR to create future Git tags and GitHub releases.
-- In GitHub Actions settings, grant workflow permissions for creating pull requests.
-
 ## suggest-image
 
 `suggest-image` is the image-bump mode. It is meant to run from the application build pipeline after a successful Docker build.
