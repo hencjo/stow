@@ -221,7 +221,7 @@ pub fn validate_image_reference(image: &str) -> Result<(), AppError> {
             "image reference must include a tag and sha256 digest (name:tag@sha256:...)",
         ));
     };
-    if !name_and_tag.contains(':') {
+    if image_tag(name_and_tag).is_none() {
         return Err(AppError::msg(
             "image reference must include an explicit tag before the digest (name:tag@sha256:...)",
         ));
@@ -240,7 +240,7 @@ pub fn validate_tagged_image(image: &str) -> Result<(), AppError> {
             "--image should not include a digest; provide name:tag and optionally supply --digest",
         ));
     }
-    let Some((_, tag)) = image.rsplit_once(':') else {
+    let Some(tag) = image_tag(image) else {
         return Err(AppError::msg(
             "--image must include an explicit tag (name:tag)",
         ));
@@ -349,7 +349,7 @@ pub fn extract_tag(image_ref: &str) -> Result<String, AppError> {
         .split_once('@')
         .map(|(name, _)| name)
         .unwrap_or(image_ref);
-    let Some((_, tag)) = without_digest.rsplit_once(':') else {
+    let Some(tag) = image_tag(without_digest) else {
         return Err(AppError::msg("Invalid image reference: missing tag"));
     };
     if tag.trim().is_empty() {
@@ -358,6 +358,15 @@ pub fn extract_tag(image_ref: &str) -> Result<String, AppError> {
         ));
     }
     Ok(tag.to_string())
+}
+
+fn image_tag(image_ref_without_digest: &str) -> Option<&str> {
+    let tag_separator = image_ref_without_digest.rfind(':')?;
+    let last_path_separator = image_ref_without_digest.rfind('/');
+    if last_path_separator.is_some_and(|path_separator| tag_separator < path_separator) {
+        return None;
+    }
+    Some(&image_ref_without_digest[tag_separator + 1..])
 }
 
 pub fn extract_digest(image_ref: &str) -> Option<String> {
@@ -727,12 +736,17 @@ containers:
     #[test]
     fn image_reference_validation_requires_tag_and_full_digest() {
         assert!(validate_image_reference(&image("api")).is_ok());
+        assert!(
+            validate_image_reference(&format!("localhost:5000/api:tag-a@sha256:{DIGEST}")).is_ok()
+        );
         // missing digest entirely
         assert!(validate_image_reference("registry.example/api:tag-a").is_err());
         // digest but no tag
         assert!(
             validate_image_reference(&format!("registry.example/api@sha256:{DIGEST}")).is_err()
         );
+        // registry port is not a tag
+        assert!(validate_image_reference(&format!("localhost:5000/api@sha256:{DIGEST}")).is_err());
         // digest too short
         assert!(validate_image_reference("registry.example/api:tag-a@sha256:abc123").is_err());
         // digest with non-hex characters
@@ -746,8 +760,10 @@ containers:
     #[test]
     fn tagged_image_validation_rejects_digest_and_missing_tag() {
         assert!(validate_tagged_image("registry.example/api:tag-a").is_ok());
+        assert!(validate_tagged_image("localhost:5000/api:tag-a").is_ok());
         assert!(validate_tagged_image(&image("api")).is_err());
         assert!(validate_tagged_image("registry.example/api").is_err());
+        assert!(validate_tagged_image("localhost:5000/api").is_err());
         assert!(validate_tagged_image("registry.example/api: ").is_err());
     }
 
@@ -755,7 +771,9 @@ containers:
     fn tag_and_digest_extraction() {
         assert_eq!(extract_tag(&image("api")).unwrap(), "tag-a");
         assert_eq!(extract_tag("registry.example/api:tag-b").unwrap(), "tag-b");
+        assert_eq!(extract_tag("localhost:5000/api:tag-c").unwrap(), "tag-c");
         assert!(extract_tag("registry.example/api").is_err());
+        assert!(extract_tag("localhost:5000/api").is_err());
         assert!(extract_tag("registry.example/api: ").is_err());
 
         assert_eq!(extract_digest(&image("api")).as_deref(), Some(DIGEST));

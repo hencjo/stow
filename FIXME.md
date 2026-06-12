@@ -11,14 +11,14 @@ Checks run:
 
 ## Findings
 
-1. **Critical: tests depend on untracked `src/test_support.rs`.**  
-   `src/main.rs:15-16` declares `mod test_support`, but `src/test_support.rs` is not git-managed. Fresh clone = broken tests. Add it to git.
+1. **Fixed: tests no longer depend on an untracked `src/test_support.rs`.**  
+   `src/test_support.rs` is now git-managed, so fresh clones can run the test suite.
 
 2. **Fixed: GitLab archive downloads no longer leak tokens via process list.**  
    Archive downloads now use in-process `ureq` requests with headers set directly on the request, so `PRIVATE-TOKEN` / `JOB-TOKEN` values are not passed as subprocess arguments.
 
-3. **High: Docker image tag parsing is wrong for registry ports.**  
-   `src/manifest.rs:224`, `243`, `347-352` treat any colon as a tag separator. `localhost:5000/api@sha256:...` wrongly passes as “tagged”. Parse the colon only after the last `/`.
+3. **Fixed: Docker image tag parsing now handles registry ports.**  
+   Image validation and tag extraction now treat a colon as a tag separator only when it appears after the last `/`, so `localhost:5000/api@sha256:...` is rejected as untagged.
 
 4. **High: daemon HTTP API has no auth.**  
    It binds `0.0.0.0:17403` by default and exposes status/trigger/badge. That’s too trusting for a root Docker deploy daemon. Add bearer auth, mTLS, or bind loopback by default.
