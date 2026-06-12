@@ -1,0 +1,9 @@
+[workspace]
+changelog_update = true
+git_only = true
+git_release_enable = true
+git_tag_enable = true
+pr_branch_prefix = "release-plz-"
+pr_labels = ["release"]
+semver_check = false
+

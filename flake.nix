@@ -11,6 +11,7 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
     in
     {
       packages = forAllSystems (
@@ -21,7 +22,7 @@
         {
           stow = pkgs.rustPlatform.buildRustPackage {
             pname = "stow";
-            version = "0.1.0";
+            version = cargoToml.package.version;
 
             src = self;
             cargoLock.lockFile = ./Cargo.lock;

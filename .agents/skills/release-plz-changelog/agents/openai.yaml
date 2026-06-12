@@ -1,0 +1,5 @@
+interface:
+  display_name: "release-plz changelog"
+  short_description: "Keep changelog entries release-plz compatible"
+  default_prompt: "Use $release-plz-changelog to prepare a release-plz-compatible changelog entry for this change."
+
