@@ -1,0 +1,26 @@
+[package]
+name = "stow"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "stow"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+opt-level = "z"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+sha2 = "0.10"
+which = "4.4"
+serde_json = "1.0"
+percent-encoding = "2.3"
+rustls = { version = "0.23.36", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1.14.0"
+ureq = { version = "2.9", features = ["json", "tls"] }

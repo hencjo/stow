@@ -1,0 +1,12 @@
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+.pre-commit-config.yaml
+
+# flake build
+result
+
+# rust build
+target/
