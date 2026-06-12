@@ -7,7 +7,10 @@
 }:
 
 {
-  packages = [ pkgs.git ];
+  packages = [
+    pkgs.gh
+    pkgs.git
+  ];
 
   git-hooks.hooks = {
     rustfmt.enable = true;
