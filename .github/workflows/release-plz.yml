@@ -13,6 +13,8 @@ jobs:
     permissions:
       contents: write
       pull-requests: read
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
     steps:
       - &checkout
         name: Checkout repository
@@ -23,6 +25,13 @@ jobs:
       - &install-rust
         name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - &install-musl
+        name: Install musl C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
       - name: Run release-plz
         uses: release-plz/action@v0.5
         with:
@@ -36,16 +45,18 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    env:
+      CC_x86_64_unknown_linux_musl: musl-gcc
     concurrency:
       group: release-plz-${{ github.ref }}
       cancel-in-progress: false
     steps:
       - *checkout
       - *install-rust
+      - *install-musl
       - name: Run release-plz
         uses: release-plz/action@v0.5
         with:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
