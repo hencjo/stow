@@ -57,11 +57,11 @@ pub enum AssignAttempt {
 }
 
 impl CliOptions {
-    pub fn parse(home: &Path, default_subfolder: &str) -> Result<Self, AppError> {
+    pub fn parse(_home: &Path, default_subfolder: &str) -> Result<Self, AppError> {
         let mut gitlab_base: Option<String> = None;
         let mut gitlab_project: Option<String> = None;
         let mut gitlab_token_config: Option<String> = None;
-        let mut keys_file = home.join("keys.txt");
+        let mut keys_file = None;
         let mut subfolder = default_subfolder.to_string();
         let mut subfolder_set = false;
         let mut sops_binary = None;
@@ -127,9 +127,7 @@ impl CliOptions {
                 subfolder = value;
                 subfolder_set = true;
             }
-            if let Some(value) = config.keys {
-                keys_file = value;
-            }
+            keys_file = config.keys;
             sops_binary = config.sops_binary;
             if let Some(value) = non_empty(config.listen) {
                 daemon_listen = value;
@@ -150,19 +148,6 @@ impl CliOptions {
                     if value.trim().is_empty() {
                         return Err(AppError::msg("--config cannot be empty"));
                     }
-                }
-                "--gitlab-base" => {
-                    return Err(AppError::msg(match mode_kind {
-                        ModeKind::Suggest => {
-                            "--gitlab-base is not used in suggest-image mode; use CI_API_V4_URL"
-                        }
-                        ModeKind::Reconcile | ModeKind::Daemon => {
-                            "--gitlab-base belongs in the config file as gitlabBase"
-                        }
-                        ModeKind::InstallSystemd => {
-                            "--gitlab-base is not used in install-systemd mode"
-                        }
-                    }));
                 }
                 "--project" => {
                     if !matches!(mode_kind, ModeKind::Suggest) {
@@ -186,22 +171,6 @@ impl CliOptions {
                     }
                     gitlab_project = Some(value);
                 }
-                "--keys" => {
-                    return Err(AppError::msg(match mode_kind {
-                        ModeKind::Reconcile | ModeKind::Daemon => {
-                            "--keys belongs in the config file"
-                        }
-                        _ => "--keys is not used in this mode",
-                    }));
-                }
-                "--sops-binary" => {
-                    return Err(AppError::msg(match mode_kind {
-                        ModeKind::Reconcile | ModeKind::Daemon => {
-                            "--sops-binary belongs in the config file as sopsBinary"
-                        }
-                        _ => "--sops-binary is not used in this mode",
-                    }));
-                }
                 "--dry-run" => {
                     if !matches!(mode_kind, ModeKind::Reconcile) {
                         return Err(AppError::msg(
@@ -217,24 +186,6 @@ impl CliOptions {
                         ));
                     }
                     plan_json = true;
-                }
-                "--listen" => {
-                    return Err(AppError::msg(match mode_kind {
-                        ModeKind::Daemon => "--listen belongs in the config file",
-                        _ => "--listen is not used in this mode",
-                    }));
-                }
-                "--tls-crt" => {
-                    return Err(AppError::msg(match mode_kind {
-                        ModeKind::Daemon => "--tls-crt belongs in the config file as tlsCrt",
-                        _ => "--tls-crt is not used in this mode",
-                    }));
-                }
-                "--tls-key" => {
-                    return Err(AppError::msg(match mode_kind {
-                        ModeKind::Daemon => "--tls-key belongs in the config file as tlsKey",
-                        _ => "--tls-key is not used in this mode",
-                    }));
                 }
                 "--subfolder" => {
                     if !matches!(mode_kind, ModeKind::Suggest) {
@@ -441,12 +392,17 @@ impl CliOptions {
                     assign: suggest_assign,
                 })
             }
-            ModeKind::Reconcile => OperationMode::Reconcile(ReconcileOptions {
-                keys_file,
-                sops_binary,
-                dry_run,
-                plan_json,
-            }),
+            ModeKind::Reconcile => {
+                let keys_file = keys_file
+                    .clone()
+                    .ok_or_else(|| AppError::msg("keys is required in config"))?;
+                OperationMode::Reconcile(ReconcileOptions {
+                    keys_file,
+                    sops_binary,
+                    dry_run,
+                    plan_json,
+                })
+            }
             ModeKind::Daemon => {
                 let config_path = absolute_path(
                     config_path
@@ -463,7 +419,9 @@ impl CliOptions {
                         AppError::msg("tlsKey is required in config for daemon mode")
                     })?),
                     reconcile: ReconcileOptions {
-                        keys_file,
+                        keys_file: keys_file
+                            .clone()
+                            .ok_or_else(|| AppError::msg("keys is required in config"))?,
                         sops_binary,
                         dry_run: false,
                         plan_json: false,
