@@ -55,7 +55,7 @@ impl Context {
     pub fn ensure_prereqs(&self) -> Result<(), AppError> {
         fs::create_dir_all(&self.data_dir)?;
         fs::create_dir_all(&self.snapshot_root)?;
-        for cmd in ["tar", "docker"] {
+        for cmd in ["docker"] {
             ensure_command_exists(cmd)?;
         }
         if !self.age_key_file.exists() {

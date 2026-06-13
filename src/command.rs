@@ -1,7 +1,9 @@
 use crate::app_error::AppError;
+use flate2::read::GzDecoder;
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Component;
 use std::path::Path;
 use std::process::Command;
 
@@ -82,27 +84,75 @@ fn map_download_error(err: ureq::Error, url: &str) -> AppError {
 }
 
 pub fn extract_archive(archive: &Path, target: &Path) -> Result<(), AppError> {
-    let mut cmd = Command::new("tar");
-    cmd.arg("xfz")
-        .arg(archive)
-        .arg("-C")
-        .arg(target)
-        .arg("--strip-components=1");
-    run_command(cmd)
+    let file = fs::File::open(archive)
+        .map_err(|err| AppError::msg(format!("failed to open {}: {err}", archive.display())))?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+        let stripped = strip_archive_root(&path)?;
+        if stripped.as_os_str().is_empty() {
+            continue;
+        }
+        entry.unpack(target.join(stripped))?;
+    }
+    Ok(())
 }
 
 pub fn detect_revision(archive: &Path) -> Result<String, AppError> {
-    let output = capture_command("tar", &[OsStr::new("tzf"), archive.as_os_str()])?;
-    let first = output.lines().next().unwrap_or("").trim().to_string();
+    let file = fs::File::open(archive)
+        .map_err(|err| AppError::msg(format!("failed to open {}: {err}", archive.display())))?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let first = archive
+        .entries()?
+        .next()
+        .transpose()?
+        .and_then(|entry| {
+            entry
+                .path()
+                .ok()
+                .and_then(|path| first_archive_component(&path))
+        })
+        .unwrap_or_else(|| "unknown".to_string());
     if let Some(hash) = first
         .split('-')
         .last()
-        .and_then(|segment| segment.strip_suffix('/'))
+        .filter(|segment| !segment.is_empty())
     {
         Ok(hash.to_string())
     } else {
-        Ok("unknown".to_string())
+        Ok(first)
     }
+}
+
+fn first_archive_component(path: &Path) -> Option<String> {
+    path.components().find_map(|component| match component {
+        Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+        _ => None,
+    })
+}
+
+fn strip_archive_root(path: &Path) -> Result<std::path::PathBuf, AppError> {
+    let mut components = path.components();
+    let Some(Component::Normal(_)) = components.next() else {
+        return Ok(std::path::PathBuf::new());
+    };
+    let mut stripped = std::path::PathBuf::new();
+    for component in components {
+        match component {
+            Component::Normal(value) => stripped.push(value),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(AppError::msg(format!(
+                    "archive contains unsafe path {}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(stripped)
 }
 
 #[cfg(test)]
@@ -111,7 +161,10 @@ mod tests {
         capture_command, detect_revision, download_file, ensure_command_exists, run_command,
     };
     use crate::test_support::TempDir;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::ffi::OsStr;
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
@@ -124,15 +177,17 @@ mod tests {
         std::fs::create_dir_all(tree.join(top_level)).unwrap();
         std::fs::write(tree.join(top_level).join("stow.yaml"), "x").unwrap();
         let archive = dir.path().join("archive.tar.gz");
-        let status = Command::new("tar")
-            .arg("czf")
-            .arg(&archive)
-            .arg("-C")
-            .arg(&tree)
-            .arg(top_level)
-            .status()
+        let file = fs::File::create(&archive).unwrap();
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        builder.append_dir(top_level, tree.join(top_level)).unwrap();
+        builder
+            .append_path_with_name(
+                tree.join(top_level).join("stow.yaml"),
+                format!("{top_level}/stow.yaml"),
+            )
             .unwrap();
-        assert!(status.success());
+        builder.finish().unwrap();
         archive
     }
 
@@ -151,7 +206,7 @@ mod tests {
 
     #[test]
     fn command_existence_check_uses_path() {
-        ensure_command_exists("tar").unwrap();
+        ensure_command_exists("bash").unwrap();
         assert!(ensure_command_exists("definitely-not-a-command-xyz").is_err());
     }
 
@@ -205,5 +260,18 @@ mod tests {
         let dir = TempDir::new("cmd-rev-plain");
         let archive = make_archive(&dir, "plain");
         assert_eq!(detect_revision(&archive).unwrap(), "plain");
+    }
+
+    #[test]
+    fn archive_extraction_strips_top_level_directory() {
+        let dir = TempDir::new("cmd-extract");
+        let archive = make_archive(&dir, "deployments-main-1d4c74beff");
+        let target = dir.path().join("out");
+        fs::create_dir_all(&target).unwrap();
+
+        super::extract_archive(&archive, &target).unwrap();
+
+        assert_eq!(fs::read_to_string(target.join("stow.yaml")).unwrap(), "x");
+        assert!(!target.join("deployments-main-1d4c74beff").exists());
     }
 }
