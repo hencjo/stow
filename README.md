@@ -155,6 +155,130 @@ Rollout failure behavior is automatic:
 
 Intentional rollback should be done by reverting Git and letting the daemon reconcile that commit.
 
+## reconcile loop
+
+The reconcile loop is deliberately boring: fetch desired state, hash it, compare it with Docker, apply the delta, verify, then either commit the new runtime state or roll back.
+
+```text
+Git revision
+  -> download deployment repo archive
+  -> select configured subfolder
+  -> decrypt SOPS files in place
+  -> compute hashes
+  -> load stow.yaml
+  -> inspect Docker containers
+  -> plan noop / replace / delete
+  -> apply plan
+  -> verify running containers
+  -> keep new state or restore previous state
+```
+
+Hashing is path-sensitive and content-sensitive. Files are walked in sorted order, and each hashed file contributes:
+
+```text
+relative/path + NUL byte + file contents
+```
+
+`stow` keeps four hashes in the plan output:
+
+- `manifest_hash`: `stow.yaml` only.
+- `config_hash`: all regular files except `stow.yaml` and decrypted secret files.
+- `secrets_hash`: decrypted secret files only.
+- `deployment_hash`: the combined hash of `manifest_hash`, `config_hash`, and `secrets_hash`.
+
+The `deployment_hash` is the identity of the desired runtime state. It changes when:
+
+- the container definition in `stow.yaml` changes
+- an image tag or digest changes
+- any non-secret config file changes
+- any decrypted secret value changes
+- a hashed file is renamed
+
+It does not change because of Git metadata, commit message text, file mtimes, directory mtimes, Docker image IDs, or unreferenced containers on the host.
+
+Runtime state transitions:
+
+```text
+downloaded repo
+  -> staging directory
+  -> ~/.stow/snapshots/<deployment_hash>
+  -> ~/running-config symlink
+```
+
+On each successful apply:
+
+1. The new staged config is moved to `~/.stow/snapshots/<deployment_hash>`.
+2. The old `~/running-config` symlink is moved to `~/running-config.previous`.
+3. `~/running-config` is pointed at the new snapshot.
+4. Metadata is written into the running config:
+   - `.git-revision`
+   - `.config-sha256`
+   - `.deployment-name`
+   - `.stow-snapshot.json`
+   - `.stow-rendered-manifest.yaml`
+5. Docker containers are reconciled.
+6. If verification passes, `running-config.previous` is removed.
+
+If apply or verification fails, `stow` restores `running-config.previous`, reapplies that previous manifest, and verifies it. This is why rollback is local and fast: the previous snapshot is already on disk.
+
+Docker reconciliation is label-based:
+
+- every managed container gets `stow.deployment=<deployment name>`
+- every managed container gets `stow.hash=v1:<deployment_hash>`
+- a desired container is `noop` only when it is running and both labels match
+- a missing, stopped, or stale-hash container is replaced
+- a labeled container no longer present in `stow.yaml` is deleted
+
+Verification requires every desired container to exist, run, keep the expected labels, avoid restarts, avoid Docker's `Restarting` state, and report `healthy` if it has a healthcheck. The deployment must remain stable for 20 seconds inside a 60 second verification window.
+
+## deploy and rollback cycle
+
+A deployment is not considered complete when `docker run` exits. It is complete only after the new desired state has been applied and verified.
+
+Normal deploy cycle:
+
+```text
+trigger received
+  -> fetch desired Git revision
+  -> decrypt and hash desired state
+  -> move desired state into running-config
+  -> stop/remove containers that should change
+  -> start replacement containers with stow labels
+  -> verify all desired containers
+  -> remove running-config.previous
+  -> report success
+```
+
+`stow` decides a deployment is good when all desired containers pass the full verification window:
+
+- the container exists
+- it is running
+- it is not in Docker's `Restarting` state
+- it has restart count `0`
+- it has `stow.deployment=<deployment name>`
+- it has `stow.hash=v1:<deployment_hash>`
+- if Docker reports a healthcheck, the health status is `healthy`
+- the whole desired deployment stays valid for 20 continuous seconds
+- this all happens before the 60 second verification timeout
+
+If any condition fails, `stow` keeps waiting until the timeout. A container that briefly looks good and then restarts resets the stable timer.
+
+Automatic rollback cycle:
+
+```text
+new deploy fails apply or verification
+  -> move running-config.previous back to running-config
+  -> load the previous manifest
+  -> plan Docker back to the previous hash
+  -> apply the rollback plan
+  -> verify the previous deployment
+  -> report the new deploy as failed
+```
+
+Rollback is therefore state rollback, not a best-effort container restart. The previous on-disk snapshot includes the previous manifest, config, decrypted secrets, Git revision metadata, and deployment hash. Docker is reconciled back to that snapshot using the same label and verification rules as a normal deploy.
+
+Intentional rollback is simpler: revert the deployment repository, merge that revert, and trigger the daemon. To `stow`, that is just another desired Git revision with its own deployment hash.
+
 ## installing daemon with systemd
 
 Copy the `stow` binary to the host first, normally:
