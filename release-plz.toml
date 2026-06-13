@@ -5,6 +5,7 @@ git_release_enable = true
 git_release_name = "{{ package }}-v{{ version }}"
 git_tag_enable = true
 git_tag_name = "{{ package }}-v{{ version }}"
+publish = false
 pr_branch_prefix = "release-plz-"
 pr_labels = ["release"]
 semver_check = false
