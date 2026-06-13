@@ -19,6 +19,7 @@ jobs:
     env:
       BIN: stow
       TARGET: x86_64-unknown-linux-musl
+      PACKAGE_PLATFORM: linux-x86_64-static
       CC_x86_64_unknown_linux_musl: musl-gcc
     steps:
       - name: Checkout repository
@@ -46,12 +47,20 @@ jobs:
         run: |
           tag="${{ github.event.release.tag_name || inputs.tag }}"
           version="${tag#stow-v}"
-          archive="${BIN}-${version}-${TARGET}.tar.gz"
+          package="${BIN}-${version}-${PACKAGE_PLATFORM}"
+          archive="${package}.tar.gz"
 
-          mkdir -p dist/pkg
-          cp "target/${TARGET}/release/${BIN}" dist/pkg/
-          tar -C dist/pkg -czf "dist/${archive}" "${BIN}"
-          sha256sum "dist/${archive}" > "dist/${archive}.sha256"
+          mkdir -p "dist/pkg/${package}"
+          cp "target/${TARGET}/release/${BIN}" "dist/pkg/${package}/"
+          cp README.md LICENSE "dist/pkg/${package}/"
+          tar \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -C dist/pkg \
+            -czf "dist/${archive}" \
+            "${package}"
+          (cd dist && sha256sum "${archive}" > "${archive}.sha256")
 
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "archive=${archive}" >> "$GITHUB_OUTPUT"
