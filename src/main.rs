@@ -17,7 +17,7 @@ mod test_support;
 mod util;
 
 use crate::app_error::AppError;
-use crate::cli::{CliOptions, OperationMode};
+use crate::cli::{is_version_arg, print_version, CliOptions, OperationMode};
 use crate::command::capture_command;
 use crate::daemon::serve;
 use crate::reconcile::run_reconcile_once;
@@ -38,6 +38,11 @@ fn main() {
 }
 
 fn run() -> Result<(), AppError> {
+    if env::args().skip(1).any(|arg| is_version_arg(&arg)) {
+        print_version();
+        return Ok(());
+    }
+
     let home = env::var_os("HOME").ok_or_else(|| AppError::msg("$HOME is not set"))?;
     let home = PathBuf::from(home);
     let hostname = env::var("HOSTNAME").unwrap_or_else(|_| {
