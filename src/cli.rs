@@ -77,6 +77,11 @@ impl CliOptions {
         let mut suggest_assign = Vec::new();
         let mut args = env::args().skip(1).collect::<Vec<_>>();
 
+        if args.iter().any(|a| is_version_arg(a)) {
+            print_version();
+            std::process::exit(0);
+        }
+
         if args.iter().any(|a| a == "--help" || a == "-h") {
             print_usage();
             std::process::exit(0);
@@ -621,6 +626,14 @@ mod tests {
     }
 
     #[test]
+    fn version_line_uses_cargo_package_metadata() {
+        assert_eq!(
+            super::version_line(),
+            format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
     fn non_empty_trims_and_filters_blank_values() {
         assert_eq!(non_empty(Some("  x  ".to_string())).as_deref(), Some("x"));
         assert_eq!(non_empty(Some("   ".to_string())), None);
@@ -673,6 +686,18 @@ mod tests {
     }
 }
 
+pub fn is_version_arg(arg: &str) -> bool {
+    arg == "--version" || arg == "-V"
+}
+
+pub fn print_version() {
+    println!("{}", version_line());
+}
+
+pub fn version_line() -> String {
+    format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+
 fn print_usage() {
     eprintln!(
         "\
@@ -711,6 +736,7 @@ install-systemd args:
 
 General:
   -h, --help           Show this help message
+  -V, --version        Show version information
 ",
     );
 }
