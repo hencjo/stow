@@ -33,9 +33,7 @@ impl Context {
         gitlab_auth_header: String,
         reconcile: crate::cli::ReconcileOptions,
     ) -> Self {
-        let sops_bin = reconcile
-            .sops_binary
-            .unwrap_or_else(|| PathBuf::from("sops"));
+        let sops_bin = PathBuf::from("sops");
         Self {
             gitlab,
             subfolder,
@@ -69,24 +67,9 @@ impl Context {
                 "GitLab token missing; set gitlabToken in the config file",
             ));
         }
-        let resolved_path = if self.sops_bin.is_absolute() {
-            if !self.sops_bin.exists() {
-                return Err(AppError::msg(format!(
-                    "sops binary not found: {}",
-                    self.sops_bin.display()
-                )));
-            }
-            self.sops_bin.display().to_string()
-        } else {
-            which::which(&self.sops_bin)
-                .map(|p| p.display().to_string())
-                .map_err(|_| {
-                    AppError::msg(format!(
-                        "sops binary \"{}\" not found in PATH; pass --sops-binary with an absolute path",
-                        self.sops_bin.display()
-                    ))
-                })?
-        };
+        let resolved_path = which::which(&self.sops_bin)
+            .map(|p| p.display().to_string())
+            .map_err(|_| AppError::msg("sops binary not found in PATH"))?;
         log(&format!("Using sops at {resolved_path}"));
         Ok(())
     }
@@ -361,7 +344,6 @@ mod tests {
             "PRIVATE-TOKEN".to_string(),
             ReconcileOptions {
                 keys_file: home.path().join("keys.txt"),
-                sops_binary: None,
                 dry_run: false,
                 plan_json: false,
             },

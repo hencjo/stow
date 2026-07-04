@@ -74,16 +74,11 @@ fn run() -> Result<(), AppError> {
         OperationMode::Reconcile(reconcile_opts) => {
             let gitlab = gitlab.ok_or_else(|| AppError::msg("GitLab config missing"))?;
             log(&format!(
-                "Resolved options: gitlab-base={}, project={}, keys={}, subfolder={}, sops-binary={}",
+                "Resolved options: gitlab-base={}, project={}, keys={}, subfolder={}",
                 gitlab.trimmed_base(),
                 gitlab.project,
                 reconcile_opts.keys_file.display(),
-                subfolder,
-                reconcile_opts
-                    .sops_binary
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "sops (PATH)".to_string())
+                subfolder
             ));
 
             let ctx = Context::new(
@@ -101,7 +96,7 @@ fn run() -> Result<(), AppError> {
             let gitlab = gitlab.ok_or_else(|| AppError::msg("GitLab config missing"))?;
             let reconcile_opts = daemon_opts.reconcile.clone();
             log(&format!(
-                "Resolved daemon options: gitlab-base={}, project={}, keys={}, subfolder={}, listen={}, tls={}, sops-binary={}",
+                "Resolved daemon options: gitlab-base={}, project={}, keys={}, subfolder={}, listen={}, tls={}",
                 gitlab.trimmed_base(),
                 gitlab.project,
                 reconcile_opts.keys_file.display(),
@@ -110,12 +105,7 @@ fn run() -> Result<(), AppError> {
                 match (&daemon_opts.tls_crt, &daemon_opts.tls_key) {
                     (Some(crt), Some(key)) => format!("{} {}", crt.display(), key.display()),
                     _ => "disabled".to_string(),
-                },
-                reconcile_opts
-                    .sops_binary
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "sops (PATH)".to_string())
+                }
             ));
             let ctx = Context::new(
                 home,

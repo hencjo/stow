@@ -123,7 +123,6 @@ gitlabToken: glpat-...
 subfolder: deploy-host.example.com
 
 keys: /root/keys.txt
-sopsBinary: /usr/bin/sops
 listen: 0.0.0.0:17403
 
 tlsCrt: /etc/stow/tls.crt
@@ -131,6 +130,7 @@ tlsKey: /etc/stow/tls.key
 ```
 
 Set `gitlabToken` in this root-only config file as the single token location.
+Install `sops` on the daemon host's `PATH`; the config file no longer accepts a custom SOPS binary path.
 
 Dry-run reconcile:
 

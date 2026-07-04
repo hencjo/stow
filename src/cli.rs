@@ -23,7 +23,6 @@ pub enum OperationMode {
 #[derive(Clone)]
 pub struct ReconcileOptions {
     pub keys_file: PathBuf,
-    pub sops_binary: Option<PathBuf>,
     pub dry_run: bool,
     pub plan_json: bool,
 }
@@ -64,7 +63,6 @@ impl CliOptions {
         let mut keys_file = None;
         let mut subfolder = default_subfolder.to_string();
         let mut subfolder_set = false;
-        let mut sops_binary = None;
         let mut dry_run = false;
         let mut plan_json = false;
         let mut daemon_listen = "0.0.0.0:17403".to_string();
@@ -133,7 +131,6 @@ impl CliOptions {
                 subfolder_set = true;
             }
             keys_file = config.keys;
-            sops_binary = config.sops_binary;
             if let Some(value) = non_empty(config.listen) {
                 daemon_listen = value;
             }
@@ -403,7 +400,6 @@ impl CliOptions {
                     .ok_or_else(|| AppError::msg("keys is required in config"))?;
                 OperationMode::Reconcile(ReconcileOptions {
                     keys_file,
-                    sops_binary,
                     dry_run,
                     plan_json,
                 })
@@ -427,7 +423,6 @@ impl CliOptions {
                         keys_file: keys_file
                             .clone()
                             .ok_or_else(|| AppError::msg("keys is required in config"))?,
-                        sops_binary,
                         dry_run: false,
                         plan_json: false,
                     },
@@ -452,14 +447,13 @@ impl CliOptions {
 }
 
 #[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ModeConfig {
     gitlab_base: Option<String>,
     project: Option<String>,
     gitlab_token: Option<String>,
     subfolder: Option<String>,
     keys: Option<PathBuf>,
-    sops_binary: Option<PathBuf>,
     listen: Option<String>,
     tls_crt: Option<PathBuf>,
     tls_key: Option<PathBuf>,
@@ -660,7 +654,7 @@ mod tests {
         let dir = TempDir::new("cli-config");
         let path = dir.write(
             "stow.yaml",
-            "gitlabBase: https://git.example/api/v4\nproject: team/deployments\ngitlabToken: glpat-x\nsubfolder: host-1\nkeys: /root/keys.txt\nsopsBinary: /usr/bin/sops\nlisten: 0.0.0.0:17403\ntlsCrt: /etc/stow/tls.crt\ntlsKey: /etc/stow/tls.key\n",
+            "gitlabBase: https://git.example/api/v4\nproject: team/deployments\ngitlabToken: glpat-x\nsubfolder: host-1\nkeys: /root/keys.txt\nlisten: 0.0.0.0:17403\ntlsCrt: /etc/stow/tls.crt\ntlsKey: /etc/stow/tls.key\n",
         );
         let config = load_config(&path).unwrap();
         assert_eq!(
@@ -671,10 +665,19 @@ mod tests {
         assert_eq!(config.gitlab_token.as_deref(), Some("glpat-x"));
         assert_eq!(config.subfolder.as_deref(), Some("host-1"));
         assert_eq!(config.keys, Some(PathBuf::from("/root/keys.txt")));
-        assert_eq!(config.sops_binary, Some(PathBuf::from("/usr/bin/sops")));
         assert_eq!(config.listen.as_deref(), Some("0.0.0.0:17403"));
         assert_eq!(config.tls_crt, Some(PathBuf::from("/etc/stow/tls.crt")));
         assert_eq!(config.tls_key, Some(PathBuf::from("/etc/stow/tls.key")));
+    }
+
+    #[test]
+    fn config_file_rejects_removed_sops_binary_field() {
+        let dir = TempDir::new("cli-config");
+        let path = dir.write(
+            "stow.yaml",
+            "gitlabBase: https://git.example/api/v4\nproject: team/deployments\ngitlabToken: glpat-x\nsubfolder: host-1\nkeys: /root/keys.txt\nsopsBinary: /usr/bin/sops\n",
+        );
+        assert!(load_config(&path).is_err());
     }
 
     #[test]
