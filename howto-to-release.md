@@ -40,7 +40,7 @@ Pushing normal work to `main` does **not** publish a release by itself. It shoul
    - The release title/version is what you expect.
 4. Merge the release PR.
 5. Wait for **Release-plz release** to create the Git tag and GitHub release.
-6. Wait for **Release artifacts** to attach the Linux static binary tarball and checksum.
+6. Wait for **Release artifacts** to attach the Linux static binary tarball and checksum. It is triggered by completion of the Release-plz workflow, because releases created with `GITHUB_TOKEN` do not reliably trigger a separate `release` workflow run.
 
 The expected release artifact names look like:
 
@@ -61,7 +61,7 @@ If the release exists but artifacts need to be rebuilt:
 stow-v0.1.0
 ```
 
-The workflow rebuilds the artifact from that tag and uploads it to the matching GitHub release with `--clobber`.
+The workflow rebuilds the artifact from that tag and uploads it to the matching GitHub release with `--clobber`. Automatic runs skip if the release already has both the tarball and checksum.
 
 ## Local sanity checks
 
