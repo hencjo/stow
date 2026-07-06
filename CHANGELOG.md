@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is managed by [release-plz](https://release-plz.dev/) from Conventional Commits.
 
+## [0.2.0](https://github.com/hencjo/stow/compare/stow-v0.1.3...stow-v0.2.0) - 2026-07-04
+
+### Added
+
+- [**breaking**] remove configurable SOPS binary path
+
 ## [0.1.3](https://github.com/hencjo/stow/compare/stow-v0.1.2...stow-v0.1.3) - 2026-07-04
 
 ### Added
