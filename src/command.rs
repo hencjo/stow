@@ -91,7 +91,10 @@ pub fn extract_archive(archive: &Path, target: &Path) -> Result<(), AppError> {
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?;
-        ensure_supported_archive_entry(&path, entry.header().entry_type())?;
+        match classify_archive_entry(&path, entry.header().entry_type())? {
+            ArchiveEntryAction::Extract => {}
+            ArchiveEntryAction::SkipMetadata => continue,
+        }
         let stripped = strip_archive_root(&path)?;
         if stripped.as_os_str().is_empty() {
             continue;
@@ -101,9 +104,25 @@ pub fn extract_archive(archive: &Path, target: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-fn ensure_supported_archive_entry(path: &Path, entry_type: tar::EntryType) -> Result<(), AppError> {
+#[derive(Debug, Eq, PartialEq)]
+enum ArchiveEntryAction {
+    Extract,
+    SkipMetadata,
+}
+
+fn classify_archive_entry(
+    path: &Path,
+    entry_type: tar::EntryType,
+) -> Result<ArchiveEntryAction, AppError> {
     if entry_type.is_file() || entry_type.is_dir() {
-        return Ok(());
+        return Ok(ArchiveEntryAction::Extract);
+    }
+    if entry_type.is_pax_global_extensions()
+        || entry_type.is_pax_local_extensions()
+        || entry_type.is_gnu_longname()
+        || entry_type.is_gnu_longlink()
+    {
+        return Ok(ArchiveEntryAction::SkipMetadata);
     }
     Err(AppError::msg(format!(
         "archive contains unsupported entry type {:?}: {}",
@@ -117,17 +136,21 @@ pub fn detect_revision(archive: &Path) -> Result<String, AppError> {
         .map_err(|err| AppError::msg(format!("failed to open {}: {err}", archive.display())))?;
     let decoder = GzDecoder::new(file);
     let mut archive = tar::Archive::new(decoder);
-    let first = archive
-        .entries()?
-        .next()
-        .transpose()?
-        .and_then(|entry| {
-            entry
-                .path()
-                .ok()
-                .and_then(|path| first_archive_component(&path))
-        })
-        .unwrap_or_else(|| "unknown".to_string());
+    let mut first = None;
+    for entry in archive.entries()? {
+        let entry = entry?;
+        let path = entry.path()?;
+        match classify_archive_entry(&path, entry.header().entry_type())? {
+            ArchiveEntryAction::SkipMetadata => continue,
+            ArchiveEntryAction::Extract => {
+                first = first_archive_component(&path);
+                if first.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+    let first = first.unwrap_or_else(|| "unknown".to_string());
     if let Some(hash) = first
         .split('-')
         .last()
@@ -193,6 +216,34 @@ mod tests {
         let file = fs::File::create(&archive).unwrap();
         let encoder = GzEncoder::new(file, Compression::default());
         let mut builder = tar::Builder::new(encoder);
+        builder.append_dir(top_level, tree.join(top_level)).unwrap();
+        builder
+            .append_path_with_name(
+                tree.join(top_level).join("stow.yaml"),
+                format!("{top_level}/stow.yaml"),
+            )
+            .unwrap();
+        builder.finish().unwrap();
+        archive
+    }
+
+    fn make_archive_with_global_pax(dir: &TempDir, top_level: &str) -> std::path::PathBuf {
+        let tree = dir.path().join("pax-tree");
+        std::fs::create_dir_all(tree.join(top_level)).unwrap();
+        std::fs::write(tree.join(top_level).join("stow.yaml"), "x").unwrap();
+        let archive = dir.path().join("pax-archive.tar.gz");
+        let file = fs::File::create(&archive).unwrap();
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+
+        let mut pax = tar::Header::new_gnu();
+        pax.set_path("pax_global_header").unwrap();
+        pax.set_entry_type(tar::EntryType::new(b'g'));
+        pax.set_mode(0o644);
+        pax.set_size(0);
+        pax.set_cksum();
+        builder.append(&pax, Cursor::new(Vec::<u8>::new())).unwrap();
+
         builder.append_dir(top_level, tree.join(top_level)).unwrap();
         builder
             .append_path_with_name(
@@ -330,6 +381,20 @@ mod tests {
 
         assert_eq!(fs::read_to_string(target.join("stow.yaml")).unwrap(), "x");
         assert!(!target.join("deployments-main-1d4c74beff").exists());
+    }
+
+    #[test]
+    fn archive_extraction_and_revision_detection_skip_global_pax_metadata() {
+        let dir = TempDir::new("cmd-extract-pax");
+        let archive = make_archive_with_global_pax(&dir, "deployments-main-1d4c74beff");
+        let target = dir.path().join("out");
+        fs::create_dir_all(&target).unwrap();
+
+        assert_eq!(detect_revision(&archive).unwrap(), "1d4c74beff");
+        super::extract_archive(&archive, &target).unwrap();
+
+        assert_eq!(fs::read_to_string(target.join("stow.yaml")).unwrap(), "x");
+        assert!(!target.join("pax_global_header").exists());
     }
 
     #[test]
