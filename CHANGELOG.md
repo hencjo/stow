@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is managed by [release-plz](https://release-plz.dev/) from Conventional Commits.
 
+## [0.2.2](https://github.com/hencjo/stow/compare/stow-v0.2.1...stow-v0.2.2) - 2026-09-08
+
+### Fixed
+
+- accept PAX metadata in deployment archives
+
 ## [0.2.1](https://github.com/hencjo/stow/compare/stow-v0.2.0...stow-v0.2.1) - 2026-09-08
 
 ### Added
