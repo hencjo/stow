@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is managed by [release-plz](https://release-plz.dev/) from Conventional Commits.
 
+## [0.2.1](https://github.com/hencjo/stow/compare/stow-v0.2.0...stow-v0.2.1) - 2026-09-08
+
+### Added
+
+- add container environment variables
+
+### Other
+
+- Attempt at fixing package builds.
+
 ## [0.2.0](https://github.com/hencjo/stow/compare/stow-v0.1.3...stow-v0.2.0) - 2026-07-04
 
 ### Added
