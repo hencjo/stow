@@ -219,31 +219,20 @@ fn enqueue_trigger(
     state: Arc<Mutex<DaemonState>>,
     ctx: Arc<Context>,
     reconcile: ReconcileOptions,
-    head_hash: Option<String>,
+    trigger_head_hash: Option<String>,
 ) -> Result<StatusResponse, AppError> {
-    let mut start_worker = None;
-    {
+    let action = {
         let mut guard = state
             .lock()
             .map_err(|_| AppError::msg("daemon state poisoned"))?;
         guard.current_hash = ctx.read_current_hash().ok().flatten();
-        if guard.phase == "idle" {
-            guard.phase = "starting".to_string();
-            guard.active_head_hash = head_hash.clone();
-            guard.last_started_at = Some(now_unix());
-            start_worker = Some(head_hash);
-        } else {
-            guard.queued = true;
-            if head_hash.is_some() {
-                guard.queued_head_hash = head_hash;
-            }
-        }
-    }
+        guard.enqueue(trigger_head_hash, now_unix())
+    };
 
-    if let Some(initial_head) = start_worker {
+    if let TriggerAction::Start(initial_trigger_head) = action {
         let state = state.clone();
         let ctx = ctx.clone();
-        thread::spawn(move || daemon_worker(state, ctx, reconcile, initial_head));
+        thread::spawn(move || daemon_worker(state, ctx, reconcile, initial_trigger_head));
     }
 
     Ok(snapshot_status(&state, &ctx, None))
@@ -253,24 +242,25 @@ fn daemon_worker(
     state: Arc<Mutex<DaemonState>>,
     ctx: Arc<Context>,
     reconcile: ReconcileOptions,
-    mut active_head_hash: Option<String>,
+    mut active_trigger_head: Option<String>,
 ) {
     loop {
         {
             if let Ok(mut guard) = state.lock() {
                 guard.phase = "reconciling".to_string();
-                guard.active_head_hash = active_head_hash.clone();
+                guard.active_head_hash = active_trigger_head.clone();
                 guard.last_started_at = Some(now_unix());
                 guard.last_error = None;
             }
         }
 
+        // Trigger hashes identify the request for status reporting. Reconciliation
+        // deliberately fetches the current default-branch HEAD instead of trusting
+        // a caller-supplied revision.
         let result = run_reconcile_once(&ctx, &reconcile);
         let latest_hash = ctx.read_current_hash().ok().flatten();
 
-        let mut next_head = None;
-        let mut should_continue = false;
-        if let Ok(mut guard) = state.lock() {
+        let next = if let Ok(mut guard) = state.lock() {
             guard.current_hash = latest_hash;
             guard.last_finished_at = Some(now_unix());
             match result {
@@ -283,23 +273,15 @@ fn daemon_worker(
                     guard.last_error = Some(err.to_string());
                 }
             }
+            guard.next_after_run()
+        } else {
+            WorkerNext::Idle
+        };
 
-            if guard.queued {
-                guard.queued = false;
-                next_head = guard.queued_head_hash.take();
-                guard.phase = "starting".to_string();
-                should_continue = true;
-            } else {
-                guard.phase = "idle".to_string();
-                guard.active_head_hash = None;
-            }
+        match next {
+            WorkerNext::Reconcile(trigger_head) => active_trigger_head = trigger_head,
+            WorkerNext::Idle => break,
         }
-
-        if should_continue {
-            active_head_hash = next_head;
-            continue;
-        }
-        break;
     }
 }
 
@@ -563,6 +545,49 @@ struct DaemonState {
     compare_cache: BTreeMap<String, CompareCacheEntry>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TriggerAction {
+    Start(Option<String>),
+    Coalesced,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WorkerNext {
+    Reconcile(Option<String>),
+    Idle,
+}
+
+impl DaemonState {
+    fn enqueue(&mut self, trigger_head_hash: Option<String>, started_at: u64) -> TriggerAction {
+        if self.phase == "idle" {
+            self.phase = "starting".to_string();
+            self.active_head_hash = trigger_head_hash.clone();
+            self.last_started_at = Some(started_at);
+            TriggerAction::Start(trigger_head_hash)
+        } else {
+            self.queued = true;
+            if trigger_head_hash.is_some() {
+                self.queued_head_hash = trigger_head_hash;
+            }
+            TriggerAction::Coalesced
+        }
+    }
+
+    fn next_after_run(&mut self) -> WorkerNext {
+        if self.queued {
+            self.queued = false;
+            let trigger_head = self.queued_head_hash.take();
+            self.phase = "starting".to_string();
+            self.active_head_hash = trigger_head.clone();
+            WorkerNext::Reconcile(trigger_head)
+        } else {
+            self.phase = "idle".to_string();
+            self.active_head_hash = None;
+            WorkerNext::Idle
+        }
+    }
+}
+
 struct CompareCacheEntry {
     expected_hash: String,
 }
@@ -601,7 +626,7 @@ fn now_unix() -> u64 {
 mod tests {
     use super::{
         json_response, percent_decode, read_request, render_badge, split_target, status_label,
-        svg_response, verify_root_read_only_path, DaemonState,
+        svg_response, verify_root_read_only_path, DaemonState, TriggerAction, WorkerNext,
     };
     use crate::test_support::TempDir;
     use std::collections::BTreeMap;
@@ -747,6 +772,39 @@ mod tests {
             status_label(&state("reconciling", false, None, None, None), None, None),
             "reconciling"
         );
+    }
+
+    #[test]
+    fn trigger_bursts_start_one_worker_and_coalesce_one_follow_up() {
+        let mut state = state("idle", false, None, None, None);
+
+        assert_eq!(
+            state.enqueue(Some("first".to_string()), 10),
+            TriggerAction::Start(Some("first".to_string()))
+        );
+        assert_eq!(state.phase, "starting");
+        assert_eq!(state.active_head_hash.as_deref(), Some("first"));
+
+        assert_eq!(
+            state.enqueue(Some("second".to_string()), 11),
+            TriggerAction::Coalesced
+        );
+        assert_eq!(
+            state.enqueue(Some("latest".to_string()), 12),
+            TriggerAction::Coalesced
+        );
+        assert!(state.queued);
+        assert_eq!(state.queued_head_hash.as_deref(), Some("latest"));
+
+        assert_eq!(
+            state.next_after_run(),
+            WorkerNext::Reconcile(Some("latest".to_string()))
+        );
+        assert!(!state.queued);
+        assert_eq!(state.active_head_hash.as_deref(), Some("latest"));
+        assert_eq!(state.next_after_run(), WorkerNext::Idle);
+        assert_eq!(state.phase, "idle");
+        assert_eq!(state.active_head_hash, None);
     }
 
     #[test]

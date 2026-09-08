@@ -246,6 +246,24 @@ mod tests {
     }
 
     #[test]
+    fn environment_change_affects_deployment_hash() {
+        let base = fixture_tree();
+        base.write(
+            "stow.yaml",
+            "deployment:\n  name: demo\ncontainers:\n  - name: api\n    image: example/api:1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    env:\n      LOG_LEVEL: \"info\"\n",
+        );
+        let changed = fixture_tree();
+        changed.write(
+            "stow.yaml",
+            "deployment:\n  name: demo\ncontainers:\n  - name: api\n    image: example/api:1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    env:\n      LOG_LEVEL: \"debug\"\n",
+        );
+
+        let base_hash = compute_deployment_hashes(base.path(), &BTreeSet::new()).unwrap();
+        let changed_hash = compute_deployment_hashes(changed.path(), &BTreeSet::new()).unwrap();
+        assert_ne!(base_hash.deployment_hash, changed_hash.deployment_hash);
+    }
+
+    #[test]
     fn renaming_a_file_changes_the_config_hash() {
         let secret_set = secrets(&["runtime/secret.env"]);
         let base = compute_deployment_hashes(fixture_tree().path(), &secret_set).unwrap();

@@ -198,7 +198,7 @@ pub fn apply_plan(
     for operation in &plan.operations {
         match operation {
             ContainerOperation::Delete(name) | ContainerOperation::Replace(name) => {
-                stop_and_remove_container(name)?
+                stop_and_remove_container(name, &desired.deployment_name)?
             }
             ContainerOperation::NoOp(_) => {}
         }
@@ -217,6 +217,20 @@ pub fn apply_plan(
                 start_container(spec, &desired.deployment_name, config_hash)?;
             }
             ContainerOperation::NoOp(_) | ContainerOperation::Delete(_) => {}
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_plan_ownership(
+    desired: &DeploymentManifest,
+    plan: &ReconcilePlan,
+) -> Result<(), AppError> {
+    for operation in &plan.operations {
+        if let ContainerOperation::Delete(name) | ContainerOperation::Replace(name) = operation {
+            if let Some((_, existing)) = inspect_container_by_name(name)? {
+                ensure_owned_by_deployment(&existing, &desired.deployment_name)?;
+            }
         }
     }
     Ok(())
@@ -466,35 +480,60 @@ fn image_present(image: &str) -> Result<bool, AppError> {
     Ok(status.success())
 }
 
-pub fn stop_and_remove_container(name: &str) -> Result<(), AppError> {
-    if !container_exists(name)? {
+fn stop_and_remove_container(name: &str, deployment_name: &str) -> Result<(), AppError> {
+    let Some((id, existing)) = inspect_container_by_name(name)? else {
         return Ok(());
-    }
+    };
+    ensure_owned_by_deployment(&existing, deployment_name)?;
+
     log(&format!("Stopping container {name}"));
     let mut stop_cmd = Command::new("docker");
-    stop_cmd.arg("stop").arg(name);
+    stop_cmd.arg("stop").arg(&id);
     run_command(stop_cmd)?;
     log(&format!("Removing container {name}"));
     let mut rm_cmd = Command::new("docker");
-    rm_cmd.arg("rm").arg(name);
+    rm_cmd.arg("rm").arg(&id);
     run_command(rm_cmd)?;
     Ok(())
 }
 
-fn container_exists(name: &str) -> Result<bool, AppError> {
-    let filter = format!("name=^/{name}$");
+fn inspect_container_by_name(name: &str) -> Result<Option<(String, ObservedContainer)>, AppError> {
     let output = capture_command(
         "docker",
         &[
             OsStr::new("ps"),
             OsStr::new("-a"),
-            OsStr::new("--filter"),
-            OsStr::new(&filter),
+            OsStr::new("--no-trunc"),
             OsStr::new("--format"),
-            OsStr::new("{{.Names}}"),
+            OsStr::new("{{.ID}}\t{{.Names}}"),
         ],
     )?;
-    Ok(output.lines().any(|line| line.trim() == name))
+    let Some(id) = container_id_for_name(&output, name) else {
+        return Ok(None);
+    };
+    Ok(inspect_container_by_id(&id)?.map(|container| (id, container)))
+}
+
+fn container_id_for_name(output: &str, name: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (id, listed_name) = line.split_once('\t')?;
+        (listed_name.trim() == name).then(|| id.trim().to_string())
+    })
+}
+
+fn ensure_owned_by_deployment(
+    container: &ObservedContainer,
+    deployment_name: &str,
+) -> Result<(), AppError> {
+    let actual = container.labels.get(LABEL_DEPLOYMENT).map(String::as_str);
+    if actual == Some(deployment_name) {
+        return Ok(());
+    }
+    Err(AppError::msg(format!(
+        "Refusing to remove container {}: expected {LABEL_DEPLOYMENT}={deployment_name}, found {}",
+        container.name,
+        actual.unwrap_or("no stow deployment label")
+    )))
 }
 
 fn start_container(
@@ -502,6 +541,16 @@ fn start_container(
     deployment_name: &str,
     config_hash: &str,
 ) -> Result<(), AppError> {
+    let cmd = build_start_container_command(spec, deployment_name, config_hash);
+    log(&format!("Starting container {}", spec.name));
+    run_command(cmd)
+}
+
+fn build_start_container_command(
+    spec: &DesiredContainerSpec,
+    deployment_name: &str,
+    config_hash: &str,
+) -> Command {
     let mut cmd = Command::new("docker");
     cmd.arg("run")
         .arg("--detach")
@@ -517,12 +566,16 @@ fn start_container(
     for flag in &spec.docker_flags {
         cmd.arg(flag);
     }
+    for (name, value) in &spec.env {
+        // Keep values out of argv: Docker copies each explicitly named variable
+        // from this child process's environment into the container.
+        cmd.env(name, value).arg("--env").arg(name);
+    }
     cmd.arg(&spec.image);
     for arg in &spec.app_args {
         cmd.arg(arg);
     }
-    log(&format!("Starting container {}", spec.name));
-    run_command(cmd)
+    cmd
 }
 
 pub fn plan_summary(plan: &ReconcilePlan) -> String {
@@ -544,6 +597,7 @@ fn versioned_hash(config_hash: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
+        build_start_container_command, container_id_for_name, ensure_owned_by_deployment,
         keep_image_references, parse_inspect_entry, plan_reconciliation, plan_summary,
         stale_image_ids, verify_container_started, versioned_hash, ContainerOperation,
         ObservedContainer,
@@ -565,6 +619,7 @@ mod tests {
                     name: name.to_string(),
                     image: format!("registry.example/{name}:1@sha256:{}", "a".repeat(64)),
                     docker_flags: Vec::new(),
+                    env: BTreeMap::new(),
                     app_args: Vec::new(),
                 })
                 .collect(),
@@ -699,6 +754,71 @@ mod tests {
     }
 
     #[test]
+    fn container_name_lookup_requires_an_exact_name() {
+        let output = "abc\tapi\ndef\tapi.old\nghi\tworker\n";
+        assert_eq!(container_id_for_name(output, "api").as_deref(), Some("abc"));
+        assert_eq!(
+            container_id_for_name(output, "api.old").as_deref(),
+            Some("def")
+        );
+        assert_eq!(container_id_for_name(output, "missing"), None);
+    }
+
+    #[test]
+    fn container_removal_requires_matching_deployment_ownership() {
+        let owned = observed("api", "demo", "h1");
+        ensure_owned_by_deployment(&owned, "demo").unwrap();
+        assert!(ensure_owned_by_deployment(&owned, "other").is_err());
+
+        let mut unmanaged = observed("api", "demo", "h1");
+        unmanaged.labels.remove("stow.deployment");
+        assert!(ensure_owned_by_deployment(&unmanaged, "demo").is_err());
+    }
+
+    #[test]
+    fn docker_run_passes_environment_in_sorted_order_before_the_image() {
+        let mut desired = manifest("demo", &["api"]);
+        let spec = &mut desired.containers[0];
+        spec.env.insert("EMPTY".to_string(), "".to_string());
+        spec.env
+            .insert("SECOND".to_string(), "left=right".to_string());
+        spec.env
+            .insert("FIRST".to_string(), "  keep me  ".to_string());
+        spec.app_args.push("serve".to_string());
+
+        let command = build_start_container_command(spec, "demo", "h1");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let image_index = args.iter().position(|arg| arg == &spec.image).unwrap();
+        assert_eq!(
+            &args[image_index - 6..image_index],
+            ["--env", "EMPTY", "--env", "FIRST", "--env", "SECOND"]
+        );
+        assert_eq!(&args[image_index + 1..], ["serve"]);
+        let command_env = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().to_string(),
+                    value.unwrap().to_string_lossy().to_string(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            command_env,
+            [
+                ("EMPTY".to_string(), "".to_string()),
+                ("FIRST".to_string(), "  keep me  ".to_string()),
+                ("SECOND".to_string(), "left=right".to_string()),
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[test]
     fn container_verification_accepts_running_labeled_container() {
         let desired = manifest("demo", &["api"]);
         verify_container_started(&desired, &observed("api", "demo", "h1"), "h1").unwrap();
@@ -776,6 +896,7 @@ mod tests {
                     image: "registry.example/web:1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                         .to_string(),
                     docker_flags: Vec::new(),
+                    env: BTreeMap::new(),
                     app_args: Vec::new(),
                 },
                 DesiredContainerSpec {
@@ -783,6 +904,7 @@ mod tests {
                     image: "registry.example/worker:1@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                         .to_string(),
                     docker_flags: Vec::new(),
+                    env: BTreeMap::new(),
                     app_args: Vec::new(),
                 },
             ],

@@ -91,6 +91,7 @@ pub fn extract_archive(archive: &Path, target: &Path) -> Result<(), AppError> {
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?;
+        ensure_supported_archive_entry(&path, entry.header().entry_type())?;
         let stripped = strip_archive_root(&path)?;
         if stripped.as_os_str().is_empty() {
             continue;
@@ -98,6 +99,17 @@ pub fn extract_archive(archive: &Path, target: &Path) -> Result<(), AppError> {
         entry.unpack(target.join(stripped))?;
     }
     Ok(())
+}
+
+fn ensure_supported_archive_entry(path: &Path, entry_type: tar::EntryType) -> Result<(), AppError> {
+    if entry_type.is_file() || entry_type.is_dir() {
+        return Ok(());
+    }
+    Err(AppError::msg(format!(
+        "archive contains unsupported entry type {:?}: {}",
+        entry_type,
+        path.display()
+    )))
 }
 
 pub fn detect_revision(archive: &Path) -> Result<String, AppError> {
@@ -165,6 +177,7 @@ mod tests {
     use flate2::Compression;
     use std::ffi::OsStr;
     use std::fs;
+    use std::io::Cursor;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
@@ -186,6 +199,50 @@ mod tests {
                 tree.join(top_level).join("stow.yaml"),
                 format!("{top_level}/stow.yaml"),
             )
+            .unwrap();
+        builder.finish().unwrap();
+        archive
+    }
+
+    fn make_archive_with_entry(
+        dir: &TempDir,
+        path: &str,
+        entry_type: tar::EntryType,
+        link_name: Option<&str>,
+    ) -> std::path::PathBuf {
+        let archive = dir.path().join("special.tar.gz");
+        let file = fs::File::create(&archive).unwrap();
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path).unwrap();
+        header.set_entry_type(entry_type);
+        header.set_mode(0o644);
+        header.set_size(0);
+        if let Some(link_name) = link_name {
+            header.set_link_name(link_name).unwrap();
+        }
+        header.set_cksum();
+        builder
+            .append(&header, Cursor::new(Vec::<u8>::new()))
+            .unwrap();
+        builder.finish().unwrap();
+        archive
+    }
+
+    fn make_archive_with_raw_path(dir: &TempDir, path: &str) -> std::path::PathBuf {
+        let archive = dir.path().join("raw-path.tar.gz");
+        let file = fs::File::create(&archive).unwrap();
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.as_mut_bytes()[..path.len()].copy_from_slice(path.as_bytes());
+        header.set_entry_type(tar::EntryType::file());
+        header.set_mode(0o644);
+        header.set_size(0);
+        header.set_cksum();
+        builder
+            .append(&header, Cursor::new(Vec::<u8>::new()))
             .unwrap();
         builder.finish().unwrap();
         archive
@@ -273,5 +330,34 @@ mod tests {
 
         assert_eq!(fs::read_to_string(target.join("stow.yaml")).unwrap(), "x");
         assert!(!target.join("deployments-main-1d4c74beff").exists());
+    }
+
+    #[test]
+    fn archive_extraction_rejects_links_and_special_entries() {
+        for (label, entry_type, link_name) in [
+            ("symlink", tar::EntryType::symlink(), Some("../../outside")),
+            ("hardlink", tar::EntryType::hard_link(), Some("root/file")),
+            ("fifo", tar::EntryType::fifo(), None),
+        ] {
+            let dir = TempDir::new(label);
+            let archive = make_archive_with_entry(&dir, "root/unsafe", entry_type, link_name);
+            let target = dir.path().join("out");
+            fs::create_dir_all(&target).unwrap();
+
+            assert!(super::extract_archive(&archive, &target).is_err());
+            assert!(!target.join("unsafe").exists());
+            assert!(!dir.path().join("outside").exists());
+        }
+    }
+
+    #[test]
+    fn archive_extraction_rejects_parent_traversal() {
+        let dir = TempDir::new("cmd-extract-traversal");
+        let archive = make_archive_with_raw_path(&dir, "root/../../outside");
+        let target = dir.path().join("out");
+        fs::create_dir_all(&target).unwrap();
+
+        assert!(super::extract_archive(&archive, &target).is_err());
+        assert!(!dir.path().join("outside").exists());
     }
 }

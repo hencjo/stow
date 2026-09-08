@@ -2,7 +2,8 @@ use crate::app_error::AppError;
 use crate::cli::ReconcileOptions;
 use crate::docker::{
     apply_plan, ensure_images_for_manifest, inspect_deployment_containers, plan_reconciliation,
-    plan_summary, prune_stale_images, verify_plan, ObservedContainer, ReconcilePlan,
+    plan_summary, prune_stale_images, validate_plan_ownership, verify_plan, ObservedContainer,
+    ReconcilePlan,
 };
 use crate::fs_utils::CleanupPath;
 use crate::fs_utils::DirLock;
@@ -42,10 +43,18 @@ pub fn reconcile(
     secret_files: &std::collections::BTreeSet<std::path::PathBuf>,
 ) -> Result<(), AppError> {
     let desired = load_manifest(staging.path(), Some(ctx.state_dir()))?;
+    let previous_manifest = ctx.load_running_manifest().transpose()?;
+    ensure_deployment_name_unchanged(
+        &desired.deployment_name,
+        previous_manifest
+            .as_ref()
+            .map(|manifest| manifest.deployment_name.as_str()),
+    )?;
     let hashes = compute_deployment_hashes(staging.path(), secret_files)?;
     let new_hash = hashes.deployment_hash.clone();
     let observed = inspect_deployment_containers(&desired.deployment_name)?;
     let plan = plan_reconciliation(&desired, &observed, &new_hash);
+    validate_plan_ownership(&desired, &plan)?;
 
     emit_plan(opts, &desired, &observed, &plan, &revision, &hashes)?;
 
@@ -69,7 +78,6 @@ pub fn reconcile(
     }
 
     ensure_images_for_manifest(&desired)?;
-    let previous_manifest = ctx.load_running_manifest().transpose()?;
 
     ctx.rotate_state_dirs(&mut staging, &new_hash)?;
     ctx.write_metadata(&revision, &new_hash, &desired.deployment_name)?;
@@ -99,6 +107,20 @@ pub fn reconcile(
     )?;
     ctx.cleanup_previous_dir()?;
     log("Reconcile completed successfully.");
+    Ok(())
+}
+
+fn ensure_deployment_name_unchanged(
+    desired_name: &str,
+    previous_name: Option<&str>,
+) -> Result<(), AppError> {
+    if let Some(previous_name) = previous_name {
+        if previous_name != desired_name {
+            return Err(AppError::msg(format!(
+                "deployment.name is immutable after the first deployment: cannot change {previous_name} to {desired_name}"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -207,4 +229,16 @@ struct PlanOutput<'a> {
     desired: &'a DeploymentManifest,
     observed: &'a [ObservedContainer],
     plan: &'a ReconcilePlan,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_deployment_name_unchanged;
+
+    #[test]
+    fn deployment_name_is_free_initially_and_immutable_afterwards() {
+        ensure_deployment_name_unchanged("demo", None).unwrap();
+        ensure_deployment_name_unchanged("demo", Some("demo")).unwrap();
+        assert!(ensure_deployment_name_unchanged("replacement", Some("demo")).is_err());
+    }
 }
