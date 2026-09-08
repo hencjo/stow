@@ -1,7 +1,10 @@
 use crate::app_error::AppError;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as DeserializeError;
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_yaml::{Mapping, Value};
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub const STOW_DEFINITION_FILE: &str = "stow.yaml";
@@ -18,6 +21,8 @@ pub struct DesiredContainerSpec {
     pub name: String,
     pub image: String,
     pub docker_flags: Vec<String>,
+    #[serde(serialize_with = "serialize_redacted_env")]
+    pub env: BTreeMap<String, String>,
     pub app_args: Vec<String>,
 }
 
@@ -46,6 +51,8 @@ struct MultiContainerSpec {
     publish: Vec<String>,
     #[serde(default)]
     volumes: Vec<VolumeMount>,
+    #[serde(default, deserialize_with = "deserialize_env")]
+    env: BTreeMap<String, String>,
     #[serde(default)]
     args: Vec<String>,
 }
@@ -126,6 +133,7 @@ fn build_multi_manifest(
             item.memory.as_deref(),
             &item.publish,
             &item.volumes,
+            item.env,
             item.args,
         )?);
     }
@@ -145,6 +153,7 @@ fn build_container_spec(
     memory: Option<&str>,
     publish: &[String],
     volumes: &[VolumeMount],
+    env: BTreeMap<String, String>,
     args: Vec<String>,
 ) -> Result<DesiredContainerSpec, AppError> {
     let name = container_name.trim().to_string();
@@ -201,6 +210,15 @@ fn build_container_spec(
         docker_flags.push(spec);
     }
 
+    for (env_name, env_value) in &env {
+        validate_env_name(env_name)?;
+        if env_value.contains('\0') {
+            return Err(AppError::msg(format!(
+                "container.env value for {env_name} must not contain a NUL byte"
+            )));
+        }
+    }
+
     let app_args = args
         .into_iter()
         .map(|arg| arg.trim().to_string())
@@ -211,8 +229,63 @@ fn build_container_spec(
         name,
         image,
         docker_flags,
+        env,
         app_args,
     })
+}
+
+fn validate_env_name(name: &str) -> Result<(), AppError> {
+    let mut chars = name.chars();
+    let starts_validly = chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic());
+    if !starts_validly || !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric()) {
+        return Err(AppError::msg(format!(
+            "container.env name {name:?} must match [A-Za-z_][A-Za-z0-9_]*"
+        )));
+    }
+    Ok(())
+}
+
+fn serialize_redacted_env<S>(
+    env: &BTreeMap<String, String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let mut map = serializer.serialize_map(Some(env.len()))?;
+    for name in env.keys() {
+        map.serialize_entry(name, "<redacted>")?;
+    }
+    map.end()
+}
+
+fn deserialize_env<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    let Value::Mapping(entries) = value else {
+        return Err(D::Error::custom("container.env must be a mapping"));
+    };
+    let mut env = BTreeMap::new();
+    for (name, value) in entries {
+        let Value::String(name) = name else {
+            return Err(D::Error::custom("container.env names must be YAML strings"));
+        };
+        let Value::String(value) = value else {
+            return Err(D::Error::custom(format!(
+                "container.env value for {name} must be a YAML string"
+            )));
+        };
+        if env.insert(name.clone(), value).is_some() {
+            return Err(D::Error::custom(format!(
+                "container.env contains duplicate name {name}"
+            )));
+        }
+    }
+    Ok(env)
 }
 
 pub fn validate_image_reference(image: &str) -> Result<(), AppError> {
@@ -597,6 +670,11 @@ containers:
         target: /data
       - source: certs
         target: /certs
+    env:
+      EMPTY: ""
+      FORMULA: "left=right"
+      PADDED: "  keep me  "
+      PORT: "8080"
     args:
       - "  --flag=1  "
       - "   "
@@ -638,7 +716,66 @@ containers:
                 "/cfg/certs:/certs",
             ]
         );
+        assert_eq!(
+            container.env,
+            [
+                ("EMPTY".to_string(), "".to_string()),
+                ("FORMULA".to_string(), "left=right".to_string()),
+                ("PADDED".to_string(), "  keep me  ".to_string()),
+                ("PORT".to_string(), "8080".to_string()),
+            ]
+            .into_iter()
+            .collect()
+        );
         assert_eq!(container.app_args, vec!["--flag=1"]);
+    }
+
+    #[test]
+    fn manifest_defaults_omitted_environment_to_empty() {
+        let raw = format!(
+            "deployment:\n  name: demo\ncontainers:\n  - name: api\n    image: {}\n",
+            image("api")
+        );
+        let manifest = build_manifest(Path::new("."), None, &raw, Path::new("stow.yaml")).unwrap();
+        assert!(manifest.containers[0].env.is_empty());
+    }
+
+    #[test]
+    fn manifest_rejects_invalid_environment_entries() {
+        let invalid_envs = [
+            "env:\n      1BAD: value",
+            "env:\n      HAS-DASH: value",
+            "env:\n      PORT: 8080",
+            "env:\n      ENABLED: true",
+            "env:\n      MISSING: null",
+            "env:\n      ITEMS: [one, two]",
+            "env:\n      BAD: \"\\0\"",
+            "env:\n      DUPLICATE: one\n      DUPLICATE: two",
+        ];
+        for env in invalid_envs {
+            let raw = format!(
+                "deployment:\n  name: demo\ncontainers:\n  - name: api\n    image: {}\n    {env}\n",
+                image("api")
+            );
+            assert!(
+                build_manifest(Path::new("."), None, &raw, Path::new("stow.yaml")).is_err(),
+                "expected rejection for:\n{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn serialized_manifest_redacts_environment_values() {
+        let raw = format!(
+            "deployment:\n  name: demo\ncontainers:\n  - name: api\n    image: {}\n    env:\n      API_TOKEN: super-secret\n      EMPTY: \"\"\n",
+            image("api")
+        );
+        let manifest = build_manifest(Path::new("."), None, &raw, Path::new("stow.yaml")).unwrap();
+        let serialized = serde_json::to_value(&manifest).unwrap();
+        let env = &serialized["containers"][0]["env"];
+        assert_eq!(env["API_TOKEN"], "<redacted>");
+        assert_eq!(env["EMPTY"], "<redacted>");
+        assert!(!serialized.to_string().contains("super-secret"));
     }
 
     #[test]

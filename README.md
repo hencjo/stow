@@ -9,7 +9,7 @@ The usual workflow is:
 1. An application pipeline builds and pushes a Docker image.
 2. `stow suggest-image` opens or updates a GitLab merge request that pins the new image digest in the deployment repo.
 3. After the MR is merged, a deployment-repo pipeline calls the host daemon.
-4. `stow daemon` reconciles the Docker host to the merged Git commit.
+4. `stow daemon` reconciles the Docker host to the latest default-branch HEAD.
 
 In OTF-style terms, `stow` treats services as code: declarative service descriptors, desired-state reconciliation, immutable digest-pinned artifacts, versioned configuration, auditable approvals, convergence status, and boring rollback behavior in a small single-binary tool.
 
@@ -83,10 +83,32 @@ Badge logic:
   ```
 - the daemon resolves that Git commit to the expected deployment hash, then compares it with the host's current running deployment hash
 - `running` means the host is running the deployment produced by that Git commit
-- `reconciling` means the daemon is actively applying that Git commit
-- `queued` means that Git commit is queued behind another reconcile
+- `reconciling` means the trigger associated with that Git commit is active while the daemon reconciles current default-branch HEAD
+- `queued` means the trigger associated with that Git commit is the coalesced follow-up behind the active reconcile
 - `different` means the host is running a deployment from another Git commit
 - `error` means the last reconcile failed
+
+## container environment
+
+Set literal environment variables per container with an `env` map:
+
+```yaml
+containers:
+  - name: webapp
+    image: registry.example.com/apps/webapp:20260428.0@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    env:
+      LOG_LEVEL: "info"
+      PORT: "8080"
+      OPTIONAL_VALUE: ""
+```
+
+Environment names must match `[A-Za-z_][A-Za-z0-9_]*`. Values must be YAML
+strings and are passed to Docker exactly as written; quote numbers and
+booleans. Host-variable inheritance, interpolation, and env files are not
+supported. SOPS-encrypted values work through the normal decrypt-before-parse
+flow. Plan JSON includes environment names but redacts every value, and Docker
+receives values through the client process environment rather than command-line
+arguments.
 
 ## daemon
 
@@ -173,6 +195,10 @@ Git revision
   -> keep new state or restore previous state
 ```
 
+Deployment archives may contain only directories and regular files. Links,
+devices, FIFOs, sparse files, and other special entries are rejected before
+extraction.
+
 Hashing is path-sensitive and content-sensitive. Files are walked in sorted order, and each hashed file contributes:
 
 ```text
@@ -225,9 +251,11 @@ Docker reconciliation is label-based:
 
 - every managed container gets `stow.deployment=<deployment name>`
 - every managed container gets `stow.hash=v1:<deployment_hash>`
+- `deployment.name` is the deployment identity and cannot change after the first successful deployment
 - a desired container is `noop` only when it is running and both labels match
 - a missing, stopped, or stale-hash container is replaced
 - a labeled container no longer present in `stow.yaml` is deleted
+- before stopping or removing a container, `stow` rechecks that its deployment label matches; an unmanaged name collision fails safely
 
 Verification requires every desired container to exist, run, keep the expected labels, avoid restarts, avoid Docker's `Restarting` state, and report `healthy` if it has a healthcheck. The deployment must remain stable for 20 seconds inside a 60 second verification window.
 
@@ -239,7 +267,7 @@ Normal deploy cycle:
 
 ```text
 trigger received
-  -> fetch desired Git revision
+  -> fetch current default-branch HEAD
   -> decrypt and hash desired state
   -> move desired state into running-config
   -> stop/remove containers that should change
@@ -319,6 +347,13 @@ curl --fail --silent --show-error \
   --request POST \
   "https://deploy-host.example.com:17403/trigger?head_hash=<git-commit-sha>"
 ```
+
+`head_hash` identifies the trigger for status and badge correlation; it does
+not pin reconciliation to a caller-supplied revision. Every run fetches current
+default-branch HEAD from GitLab. The daemon runs one reconcile at a time and
+coalesces any number of triggers received while busy into one follow-up run.
+There is no unbounded queue or concurrent reconcile fan-out, though a sustained
+stream of triggers can keep scheduling successive follow-ups.
 
 Check status:
 
