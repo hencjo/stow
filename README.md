@@ -195,9 +195,9 @@ Git revision
   -> keep new state or restore previous state
 ```
 
-Deployment archives may contain only directories and regular files. Links,
-devices, FIFOs, sparse files, and other special entries are rejected before
-extraction.
+Deployment archives may contain only directories and regular files. PAX and
+GNU extension metadata headers are ignored; links, devices, FIFOs, sparse
+files, and other special entries are rejected before extraction.
 
 Hashing is path-sensitive and content-sensitive. Files are walked in sorted order, and each hashed file contributes:
 
