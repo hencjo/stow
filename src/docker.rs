@@ -919,3 +919,76 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod suggestion_runtime_tests {
+    use super::*;
+    use crate::hashing::compute_deployment_hashes;
+    use crate::manifest::{load_manifest, update_manifest_suggestion};
+    use crate::test_support::TempDir;
+
+    #[test]
+    fn env_only_suggestion_loads_hashes_and_replaces_container_without_overriding_built_revision() {
+        let dir = TempDir::new("suggestion-runtime");
+        let image = format!("registry.example/kappa:370d336@sha256:{}", "a".repeat(64));
+        let raw = format!("deployment: {{name: kappa}}\ncontainers:\n  - name: kappa\n    image: {image}\n    env:\n      RELEASE_VERSION: \"old\"\n");
+        dir.write("stow.yaml", &raw);
+        let old_hash = compute_deployment_hashes(dir.path(), &BTreeSet::new())
+            .unwrap()
+            .deployment_hash;
+        let updated = update_manifest_suggestion(
+            &raw,
+            Some("kappa"),
+            &image,
+            &[("RELEASE_VERSION".into(), "20260914.0".into())],
+        )
+        .unwrap();
+        dir.write("stow.yaml", &updated.rendered);
+        let desired = load_manifest(dir.path(), None).unwrap();
+        let hash = compute_deployment_hashes(dir.path(), &BTreeSet::new())
+            .unwrap()
+            .deployment_hash;
+        assert_ne!(hash, old_hash);
+        let observed = ObservedContainer {
+            name: "kappa".into(),
+            running: true,
+            restarting: false,
+            restart_count: 0,
+            health_status: None,
+            labels: [
+                (LABEL_DEPLOYMENT.into(), "kappa".into()),
+                (LABEL_VERSIONED_HASH.into(), versioned_hash(&old_hash)),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let plan = plan_reconciliation(&desired, &[observed], &hash);
+        assert!(
+            matches!(&plan.operations[..], [ContainerOperation::Replace(name)] if name == "kappa")
+        );
+        let command = build_start_container_command(&desired.containers[0], "kappa", &hash);
+        let values: BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(k, v)| (k.to_str().unwrap(), v.unwrap().to_str().unwrap()))
+            .collect();
+        assert_eq!(values.get("RELEASE_VERSION"), Some(&"20260914.0"));
+        assert!(!values.contains_key("SOURCE_REVISION"));
+        let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert!(args.contains(&"RELEASE_VERSION"));
+        assert!(!args.contains(&"20260914.0"));
+        assert!(args.contains(&image.as_str()));
+
+        let explicit = update_manifest_suggestion(
+            &updated.rendered,
+            Some("kappa"),
+            &image,
+            &[("SOURCE_REVISION".into(), "explicit".into())],
+        )
+        .unwrap();
+        dir.write("stow.yaml", &explicit.rendered);
+        assert_eq!(
+            load_manifest(dir.path(), None).unwrap().containers[0].env["SOURCE_REVISION"],
+            "explicit"
+        );
+    }
+}

@@ -44,6 +44,8 @@ pub struct SuggestOptions {
     pub image: String,
     pub digest: Option<String>,
     pub changelog_file: Option<String>,
+    pub env: Vec<(String, String)>,
+    pub release_version: Option<String>,
     pub container: Option<String>,
     pub assign: Vec<AssignAttempt>,
 }
@@ -57,6 +59,10 @@ pub enum AssignAttempt {
 
 impl CliOptions {
     pub fn parse(_home: &Path, default_subfolder: &str) -> Result<Self, AppError> {
+        Self::parse_args(default_subfolder, env::args().skip(1).collect())
+    }
+
+    fn parse_args(default_subfolder: &str, mut args: Vec<String>) -> Result<Self, AppError> {
         let mut gitlab_base: Option<String> = None;
         let mut gitlab_project: Option<String> = None;
         let mut gitlab_token_config: Option<String> = None;
@@ -71,16 +77,17 @@ impl CliOptions {
         let mut suggest_image = None;
         let mut suggest_digest = None;
         let mut changelog_file = None;
+        let mut suggest_env: Vec<(String, String)> = Vec::new();
+        let mut release_version = None;
         let mut suggest_container = None;
         let mut suggest_assign = Vec::new();
-        let mut args = env::args().skip(1).collect::<Vec<_>>();
 
-        if args.iter().any(|a| is_version_arg(a)) {
+        if has_global_argument(&args, is_version_arg) {
             print_version();
             std::process::exit(0);
         }
 
-        if args.iter().any(|a| a == "--help" || a == "-h") {
+        if has_global_argument(&args, |a| a == "--help" || a == "-h") {
             print_usage();
             std::process::exit(0);
         }
@@ -238,6 +245,29 @@ impl CliOptions {
                         .clone();
                     suggest_digest = Some(value);
                 }
+                "--env" | "--release-version" => {
+                    if !matches!(mode_kind, ModeKind::Suggest) {
+                        return Err(AppError::msg(format!(
+                            "{arg} is only available in suggest-image mode"
+                        )));
+                    }
+                    idx += 1;
+                    let value = args
+                        .get(idx)
+                        .filter(|v| !v.starts_with("--"))
+                        .ok_or_else(|| AppError::msg(format!("{arg} requires a value")))?;
+                    if arg == "--env" {
+                        let pair = parse_env_assignment(value)?;
+                        if let Some(old) = suggest_env.iter_mut().find(|(name, _)| name == &pair.0)
+                        {
+                            *old = pair;
+                        } else {
+                            suggest_env.push(pair);
+                        }
+                    } else {
+                        release_version = Some(validate_release_version(value)?);
+                    }
+                }
                 "--changelog-file" => {
                     if !matches!(mode_kind, ModeKind::Suggest) {
                         return Err(AppError::msg(
@@ -390,6 +420,8 @@ impl CliOptions {
                     image,
                     digest: suggest_digest,
                     changelog_file,
+                    env: suggest_env,
+                    release_version,
                     container: suggest_container,
                     assign: suggest_assign,
                 })
@@ -471,7 +503,7 @@ fn config_path_from_args(args: &[String], mode: ModeKind) -> Result<Option<PathB
             }
             return Ok(Some(PathBuf::from(value)));
         }
-        idx += 1;
+        idx += if option_takes_value(&args[idx]) { 2 } else { 1 };
     }
     let _ = mode;
     Ok(None)
@@ -693,6 +725,36 @@ pub fn is_version_arg(arg: &str) -> bool {
     arg == "--version" || arg == "-V"
 }
 
+fn option_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--config"
+            | "--project"
+            | "--subfolder"
+            | "--image"
+            | "--digest"
+            | "--container"
+            | "--assign"
+            | "--changelog-file"
+            | "--env"
+            | "--release-version"
+    )
+}
+
+// A flag-looking option value is not a global flag (nor another --config).
+pub fn has_global_argument(args: &[String], predicate: fn(&str) -> bool) -> bool {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if predicate(arg) {
+            return true;
+        }
+        if option_takes_value(arg) {
+            args.next();
+        }
+    }
+    false
+}
+
 pub fn print_version() {
     println!("{}", version_line());
 }
@@ -701,13 +763,33 @@ pub fn version_line() -> String {
     format!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
 }
 
+fn parse_env_assignment(value: &str) -> Result<(String, String), AppError> {
+    let (name, value) = value
+        .split_once('=')
+        .ok_or_else(|| AppError::msg("--env requires NAME=VALUE"))?;
+    crate::manifest::validate_env_name(name)?;
+    if value.contains('\0') {
+        return Err(AppError::msg("--env values must not contain NUL"));
+    }
+    Ok((name.into(), value.into()))
+}
+
+fn validate_release_version(value: &str) -> Result<String, AppError> {
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        return Err(AppError::msg(
+            "--release-version must be nonblank and contain no control characters",
+        ));
+    }
+    Ok(value.into())
+}
+
 fn print_usage() {
     eprintln!(
         "\
 Usage: stow MODE [OPTIONS]
 
 Modes (required):
-  suggest-image        Suggest bumping the Docker image version
+  suggest-image        Suggest Docker image and environment changes
   reconcile            Apply desired state
   daemon               Run webhook-driven reconcile daemon
   install-systemd      Upsert and restart the stow systemd service
@@ -719,7 +801,10 @@ suggest-image args:
   --digest <HASH>          SHA256 manifest digest (optional, will resolve if omitted)
   --container <NAME>       Target container (required)
   --assign <ORDER>         Ordered MR assignment attempts: gitlab_user_id,id:<id>,user:<username>
-  --changelog-file <PATH> Include added markdown changelog lines between image tags (optional)
+  --env <NAME=VALUE>       Set target container environment (repeatable; last value wins)
+  --release-version <STR>  Explicit display version; image tags are treated as opaque
+  --changelog-file <PATH>  Include changelog entries (explicit version section or legacy tag diff)
+  Environment values are literal, committed to Git, and shown in the MR; not for secrets.
 suggest-image env:
   CI_API_V4_URL             GitLab API base URL (required)
   GITLAB_ACCESS_TOKEN       GitLab token (preferred)
@@ -742,4 +827,67 @@ General:
   -V, --version        Show version information
 ",
     );
+}
+
+#[cfg(test)]
+mod release_flag_tests {
+    use super::*;
+    #[test]
+    fn environment_assignments_are_literal_and_allow_empty_values() {
+        assert_eq!(
+            parse_env_assignment("A=one=two").unwrap(),
+            ("A".into(), "one=two".into())
+        );
+        assert_eq!(parse_env_assignment("A=").unwrap(), ("A".into(), "".into()));
+        assert_eq!(
+            parse_env_assignment("_A=$HOME {{literal}}").unwrap().1,
+            "$HOME {{literal}}"
+        );
+        for value in ["A", "=x", "1A=x", "A-B=x", " A=x", "A=x\0y"] {
+            assert!(parse_env_assignment(value).is_err());
+        }
+    }
+    #[test]
+    fn display_version_is_opaque_but_not_blank_or_control_containing() {
+        assert_eq!(
+            validate_release_version("20260914.0").unwrap(),
+            "20260914.0"
+        );
+        assert!(validate_release_version("test.2").is_ok());
+        for value in ["", "  ", "test\n2", "test\u{1b}2"] {
+            assert!(validate_release_version(value).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod release_parser_tests {
+    use super::*;
+    #[test]
+    fn release_flags_reject_wrong_modes_missing_values_and_invalid_inputs() {
+        let path = std::env::temp_dir().join(format!(
+            "stow-cli-{}.yaml",
+            crate::util::unique_suffix().unwrap()
+        ));
+        std::fs::write(&path, "{}\n").unwrap();
+        for (args, message) in [
+            (vec!["reconcile", "--env", "A=b"], "only"),
+            (vec!["daemon", "--release-version", "1"], "only"),
+            (vec!["suggest-image", "--env"], "requires"),
+            (vec!["suggest-image", "--release-version"], "requires"),
+            (vec!["suggest-image", "--env", "A"], "NAME=VALUE"),
+            (vec!["suggest-image", "--release-version", " "], "blank"),
+        ] {
+            let mut args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+            if args[0] != "suggest-image" {
+                args.extend(["--config".into(), path.to_string_lossy().into_owned()]);
+            }
+            let error = CliOptions::parse_args("host", args)
+                .err()
+                .expect("invalid CLI must fail")
+                .to_string();
+            assert!(error.contains(message), "{error}");
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 }

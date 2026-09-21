@@ -8,7 +8,7 @@ use crate::gitlab::{
 use crate::manifest::{
     current_manifest_daemon_base_url, current_manifest_image_reference,
     ensure_version_not_downgraded, extract_digest, extract_tag, normalize_digest,
-    update_manifest_image_reference, validate_tagged_image, STOW_DEFINITION_FILE,
+    update_manifest_suggestion, validate_tagged_image, EnvironmentChange, STOW_DEFINITION_FILE,
 };
 use serde_json::Value;
 use std::env;
@@ -23,19 +23,21 @@ pub fn suggest(
     gitlab_auth_header: &str,
     opts: &SuggestOptions,
 ) -> Result<(), AppError> {
-    println!("[suggest] Suggesting image bump to {}", opts.image);
+    println!(
+        "[suggest] Preparing image and environment suggestion for {}",
+        opts.image
+    );
 
     let client = GitLabClient::new(gitlab, gitlab_token, gitlab_auth_header);
-    let assignee = resolve_assignee(&client, &opts.assign)?;
     let project = client.project_info()?;
     let target_branch = project.default_branch;
-    let _ = client.branch_info(&target_branch)?.ok_or_else(|| {
+    let target_info = client.branch_info(&target_branch)?.ok_or_else(|| {
         AppError::msg(format!("Target branch {target_branch} not found in GitLab"))
     })?;
     let service_path = service_file_path(subfolder);
     println!("[suggest] Fetching {service_path} from {target_branch} via GitLab Files API...");
     let content = client
-        .file_contents(&service_path, &target_branch)?
+        .file_contents(&service_path, &target_info.commit.id)?
         .ok_or_else(|| AppError::msg(format!("{service_path} not found in {target_branch}")))?;
 
     validate_tagged_image(&opts.image)?;
@@ -45,7 +47,9 @@ pub fn suggest(
 
     let current_tag = extract_tag(&current_ref)?;
     let new_tag = extract_tag(&opts.image)?;
-    ensure_version_not_downgraded(&current_tag, &new_tag)?;
+    if opts.release_version.is_none() {
+        ensure_version_not_downgraded(&current_tag, &new_tag)?;
+    }
 
     let digest = if let Some(ref d) = opts.digest {
         normalize_digest(d).ok_or_else(|| {
@@ -56,7 +60,12 @@ pub fn suggest(
     };
 
     let new_ref = format!("{}@sha256:{}", opts.image, digest);
-    let update = update_manifest_image_reference(&content, opts.container.as_deref(), &new_ref)?;
+    let update =
+        update_manifest_suggestion(&content, opts.container.as_deref(), &new_ref, &opts.env)?;
+    if update.rendered == content {
+        println!("[suggest] Target branch already has the requested image and environment; nothing to do.");
+        return Ok(());
+    }
 
     let current_digest = extract_digest(&current_ref).unwrap_or_else(|| "unknown".to_string());
     let new_digest = extract_digest(&new_ref).unwrap_or_else(|| "unknown".to_string());
@@ -65,17 +74,20 @@ pub fn suggest(
     println!("[suggest] Current image: {current_ref}");
     println!("[suggest] Proposed image: {new_ref}");
 
-    let changelog_changes = if new_tag != current_tag {
+    let changelog_changes = if opts.release_version.is_some() || new_tag != current_tag {
         opts.changelog_file.as_deref().and_then(|path| {
-            match collect_changelog_changes(Path::new(path), &current_tag, &new_tag) {
+            let changes = if let Some(version) = &opts.release_version {
+                collect_release_changelog(Path::new(path), version)
+            } else {
+                collect_changelog_changes(Path::new(path), &current_tag, &new_tag)
+            };
+            match changes {
                 Ok(Some(changes)) => {
                     println!("[suggest] Including changelog changes from {path}.");
                     Some(changes)
                 }
                 Ok(None) => {
-                    println!(
-                        "[suggest] No changelog additions found between {current_tag} and {new_tag} in {path}."
-                    );
+                    println!("[suggest] No matching changelog additions found in {path}.");
                     None
                 }
                 Err(err) => {
@@ -89,21 +101,27 @@ pub fn suggest(
     };
 
     println!("[suggest] Creating or updating merge request...");
+    let assignee = resolve_assignee(&client, &opts.assign)?;
     let mr = submit_merge_request(
-        gitlab,
-        gitlab_token,
-        gitlab_auth_header,
-        subfolder,
-        &selected_container,
-        &current_tag,
-        &new_ref,
-        &new_tag,
-        &current_digest,
-        &new_digest,
-        &update.rendered,
-        assignee,
-        changelog_changes,
-        daemon_base_url.as_deref(),
+        &client,
+        PreparedSuggestion {
+            subfolder,
+            container_name: &selected_container,
+            current_tag: &current_tag,
+            new_ref: &new_ref,
+            new_tag: &new_tag,
+            current_digest: &current_digest,
+            new_digest: &new_digest,
+            rendered_service: &update.rendered,
+            assignee,
+            changelog_changes: changelog_changes.as_deref(),
+            daemon_base_url: daemon_base_url.as_deref(),
+            target_branch: &target_branch,
+            target_revision: &target_info.commit.id,
+            release_version: opts.release_version.as_deref(),
+            env_changes: &update.env_changes,
+            image_changed: current_ref != new_ref,
+        },
     )?;
     println!(
         "[suggest] Merge request {}: {}",
@@ -160,43 +178,79 @@ fn resolve_assignee(
     Ok(None)
 }
 
-fn submit_merge_request(
-    gitlab: &GitLabConfig,
-    gitlab_token: &str,
-    gitlab_auth_header: &str,
-    subfolder: &str,
-    container_name: &str,
-    current_tag: &str,
-    new_ref: &str,
-    new_tag: &str,
-    current_digest: &str,
-    new_digest: &str,
-    rendered_service: &str,
+// All proposal data is derived from one immutable default-branch revision.
+struct PreparedSuggestion<'a> {
+    subfolder: &'a str,
+    container_name: &'a str,
+    current_tag: &'a str,
+    new_ref: &'a str,
+    new_tag: &'a str,
+    current_digest: &'a str,
+    new_digest: &'a str,
+    rendered_service: &'a str,
     assignee: Option<u64>,
-    changelog_changes: Option<String>,
-    daemon_base_url: Option<&str>,
-) -> Result<MergeRequestResult, AppError> {
-    let client = GitLabClient::new(gitlab, gitlab_token, gitlab_auth_header);
-    let project = client.project_info()?;
-    let target_branch = project.default_branch;
-    let target_branch_info = client.branch_info(&target_branch)?.ok_or_else(|| {
-        AppError::msg(format!("Target branch {target_branch} not found in GitLab"))
-    })?;
+    changelog_changes: Option<&'a str>,
+    daemon_base_url: Option<&'a str>,
+    target_branch: &'a str,
+    target_revision: &'a str,
+    release_version: Option<&'a str>,
+    env_changes: &'a [EnvironmentChange],
+    image_changed: bool,
+}
 
+fn submit_merge_request(
+    client: &GitLabClient<'_>,
+    proposal: PreparedSuggestion<'_>,
+) -> Result<MergeRequestResult, AppError> {
+    let PreparedSuggestion {
+        subfolder,
+        container_name,
+        current_tag,
+        new_ref,
+        new_tag,
+        current_digest,
+        new_digest,
+        rendered_service,
+        assignee,
+        changelog_changes,
+        daemon_base_url,
+        target_branch,
+        target_revision,
+        release_version,
+        env_changes,
+        image_changed,
+    } = proposal;
+    let current_head = client
+        .branch_info(target_branch)?
+        .ok_or_else(|| AppError::msg("target branch disappeared"))?;
+    if current_head.commit.id != target_revision {
+        return Err(AppError::msg(
+            "target branch changed while preparing suggestion; retry",
+        ));
+    }
     let branch_name = suggestion_branch_name(subfolder, container_name);
     let service_path = service_file_path(subfolder);
-    let target_content = client.file_contents(&service_path, &target_branch)?;
-    let badge_revision = if target_content
-        .as_deref()
-        .map(|content| content != rendered_service)
-        .unwrap_or(true)
-    {
+    let pending = client.branch_info(&branch_name)?;
+    let mut matching_revision = None;
+    if let Some(info) = pending {
+        let content = client.file_contents(&service_path, &info.commit.id)?;
+        if content.as_deref() == Some(rendered_service) {
+            matching_revision = Some(info.commit.id);
+        }
+    }
+    let badge_revision = if let Some(revision) = matching_revision {
+        println!("[suggest] Suggestion branch already has the requested content; reusing commit.");
+        revision
+    } else {
         let commit_payload = GitLabCommitRequest {
             branch: branch_name.clone(),
-            start_branch: Some(target_branch.clone()),
+            start_branch: None,
+            start_sha: Some(target_revision.into()),
             force: Some(true),
             last_commit_id: None,
-            commit_message: format!("Bump {subfolder}/{container_name} image to {new_ref}"),
+            commit_message: format!(
+                "Update {subfolder}/{container_name} to {new_ref} and deployment environment"
+            ),
             actions: vec![GitLabCommitAction {
                 action: "update".to_string(),
                 file_path: service_path.clone(),
@@ -204,18 +258,17 @@ fn submit_merge_request(
             }],
         };
         client.create_commit(&commit_payload)?.id
-    } else {
-        println!("[suggest] Target branch already has the requested content; skipping commit.");
-        target_branch_info.commit.id
     };
 
     let digest_changed = current_digest != new_digest;
-    let title = merge_request_title(
+    let title = suggestion_title(
         subfolder,
         container_name,
         current_tag,
         new_tag,
         digest_changed,
+        release_version,
+        !env_changes.is_empty() && !image_changed,
     );
     let description = merge_request_description(
         subfolder,
@@ -225,11 +278,24 @@ fn submit_merge_request(
         current_digest,
         new_digest,
         &badge_revision,
-        changelog_changes.as_deref(),
+        changelog_changes,
         daemon_base_url,
     );
 
-    if let Some(existing) = client.find_open_merge_request(&branch_name, &target_branch)? {
+    let description = decorate_description(
+        description,
+        subfolder,
+        container_name,
+        current_tag,
+        new_tag,
+        current_digest,
+        new_digest,
+        release_version,
+        env_changes,
+        image_changed,
+    );
+
+    if let Some(existing) = client.find_open_merge_request(&branch_name, target_branch)? {
         let payload = MergeRequestUpdatePayload {
             title,
             description,
@@ -244,7 +310,7 @@ fn submit_merge_request(
     } else {
         let payload = MergeRequestPayload {
             source_branch: branch_name,
-            target_branch,
+            target_branch: target_branch.into(),
             title,
             description,
             assignee_id: assignee,
@@ -256,6 +322,102 @@ fn submit_merge_request(
             updated: false,
         })
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn suggestion_title(
+    subfolder: &str,
+    container: &str,
+    old_tag: &str,
+    new_tag: &str,
+    digest_changed: bool,
+    version: Option<&str>,
+    env_changed: bool,
+) -> String {
+    if let Some(version) = version {
+        format!(
+            "Release {subfolder}/{container} {}",
+            markdown_value(version)
+        )
+    } else if old_tag == new_tag && !digest_changed && env_changed {
+        format!("Update {subfolder}/{container} environment")
+    } else {
+        merge_request_title(subfolder, container, old_tag, new_tag, digest_changed)
+    }
+}
+
+fn markdown_value(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+            out.extend(ch.escape_default());
+        } else {
+            if "\\`*_{}[]()<>!#|~".contains(ch) {
+                out.push('\\');
+            }
+            out.push(ch);
+        }
+    }
+    if out.is_empty() {
+        "(empty)".into()
+    } else {
+        out
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decorate_description(
+    mut body: String,
+    subfolder: &str,
+    container: &str,
+    old_tag: &str,
+    new_tag: &str,
+    old_digest: &str,
+    new_digest: &str,
+    version: Option<&str>,
+    changes: &[EnvironmentChange],
+    image_changed: bool,
+) -> String {
+    let replacement = if let Some(version) = version {
+        Some(format!("Release {} for `{subfolder}/{container}`.\n\nImage tag: {} -> {}.\nImage digest: {} -> {}.",
+            markdown_value(version), markdown_value(old_tag), markdown_value(new_tag), old_digest, new_digest))
+    } else if !image_changed && !changes.is_empty() {
+        Some(format!("Environment update for `{subfolder}/{container}`."))
+    } else {
+        None
+    };
+    if let Some(replacement) = replacement {
+        let end = body
+            .find("\n\n[![stow convergence]")
+            .or_else(|| body.find("\n\nChangelog:"))
+            .unwrap_or(body.len());
+        body.replace_range(..end, &replacement);
+    }
+    if !changes.is_empty() {
+        let mut env = String::from("\n\nEnvironment changes:\n");
+        for change in changes {
+            env.push_str(&format!(
+                "- {}: {} -> {}\n",
+                change.name,
+                change
+                    .previous
+                    .as_deref()
+                    .map(markdown_value)
+                    .unwrap_or_else(|| "unset".into()),
+                markdown_value(&change.proposed)
+            ));
+        }
+        let offset = body.find("\n\nChangelog:").unwrap_or(body.len());
+        body.insert_str(offset, env.trim_end());
+    }
+    if let Some(version) = version {
+        body = body.replacen(
+            "\n\nChangelog:",
+            &format!("\n\nChangelog ({}):", markdown_value(version)),
+            1,
+        );
+    }
+    body
 }
 
 fn suggestion_branch_name(subfolder: &str, container_name: &str) -> String {
@@ -325,15 +487,79 @@ fn merge_request_description(
         ));
     }
     if let Some(changes) = changelog_changes {
-        body.push_str("\n\nChangelog:\n```markdown\n");
+        // Never let a changelog's own fence terminate its source presentation.
+        let longest_run = changes
+            .split(|ch| ch != '`')
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        let fence = "`".repeat(3.max(longest_run + 1));
+        body.push_str(&format!("\n\nChangelog:\n{fence}markdown\n"));
         body.push_str(changes);
-        body.push_str("\n```");
+        body.push_str(&format!("\n{fence}"));
     }
     body
 }
 
 fn url_encode(value: &str) -> String {
     percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+fn collect_release_changelog(path: &Path, version: &str) -> Result<Option<String>, AppError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| AppError::msg(format!("cannot read changelog {}: {e}", path.display())))?;
+    release_changelog_section(&text, version)
+}
+
+/// The changelog section for `version`, from a file that is either headerless on top, starts
+/// with a `# Unreleased` heading (the gitlab/release.sh format: those entries become the release
+/// on promotion, so the heading itself is not quoted), or starts with a heading ending in `version`.
+fn release_changelog_section(text: &str, version: &str) -> Result<Option<String>, AppError> {
+    let mut selected = String::new();
+    let mut fence: Option<(char, usize)> = None;
+    let mut content_seen = false;
+    let mut unreleased_heading_seen = false;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let marker = trimmed.chars().next().filter(|c| matches!(c, '`' | '~'));
+        let run = marker
+            .map(|c| trimmed.chars().take_while(|v| *v == c).count())
+            .unwrap_or(0);
+        let in_fence = fence.is_some();
+        if let Some((kind, length)) = fence {
+            if marker == Some(kind) && run >= length && trimmed[run..].trim().is_empty() {
+                fence = None;
+            }
+        } else if run >= 3 {
+            fence = marker.map(|c| (c, run));
+        }
+        if !in_fence && run < 3 {
+            if let Some(heading) = trimmed.strip_prefix("# ") {
+                if content_seen || unreleased_heading_seen {
+                    break;
+                }
+                let heading = heading.trim().trim_end_matches('#').trim_end();
+                if heading == "Unreleased" {
+                    unreleased_heading_seen = true;
+                    continue;
+                }
+                if heading.split_whitespace().last() != Some(version) {
+                    return Err(AppError::msg(
+                        "top changelog release header does not match --release-version",
+                    ));
+                }
+                content_seen = true;
+                selected.push_str(line);
+                continue;
+            }
+        }
+        if !line.trim().is_empty() {
+            content_seen = true;
+        }
+        selected.push_str(line);
+    }
+    let section = selected.trim().to_owned();
+    Ok((!section.is_empty()).then_some(section))
 }
 
 fn collect_changelog_changes(
@@ -800,4 +1026,178 @@ fn pull_image_and_get_local_digest(image: &str) -> Result<String, AppError> {
             digest
         ))
     })
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+    #[test]
+    fn release_sections_support_headerless_and_versioned_blocks_and_fences() {
+        let headerless = "\n- New release\n\n## Fixes\n- Bug\n```markdown\n# Kappa old\n```\n\n# Kappa 20260908.0\n- Old";
+        let section = release_changelog_section(headerless, "20260914.0")
+            .unwrap()
+            .unwrap();
+        assert!(section.starts_with("- New release"));
+        assert!(section.contains("## Fixes"));
+        assert!(section.contains("# Kappa old"));
+        assert!(!section.contains("20260908.0"));
+        assert_eq!(
+            release_changelog_section(
+                "# Kappa 20260914.0\n- New\n# Kappa 20260908.0\n- Old",
+                "20260914.0"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("# Kappa 20260914.0\n- New")
+        );
+        assert!(release_changelog_section("# Kappa other\n- Old", "20260914.0").is_err());
+        assert!(release_changelog_section(" \n", "test").unwrap().is_none());
+        // gitlab/release.sh format: the entries under `# Unreleased` are the release being
+        // promoted; the heading itself is not quoted, and the released section below is excluded.
+        assert_eq!(
+            release_changelog_section(
+                "# Unreleased\n\n- New\n\n## Fixes\n- Bug\n\n# Kappa 20260919.0 (2026-09-19 11:38:52)\n- Old",
+                "20260921.0"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("- New\n\n## Fixes\n- Bug")
+        );
+        assert!(release_changelog_section(
+            "# Unreleased\n\n# Kappa 20260919.0\n- Old",
+            "20260921.0"
+        )
+        .unwrap()
+        .is_none());
+        assert!(
+            collect_release_changelog(Path::new("/nonexistent/stow-changelog"), "test").is_err()
+        );
+    }
+    #[test]
+    fn explicit_release_and_env_only_metadata_are_accurate_and_escape_values() {
+        let changes = vec![EnvironmentChange {
+            name: "RELEASE_VERSION".into(),
+            previous: Some("test.1".into()),
+            proposed: "test.2".into(),
+        }];
+        let original = merge_request_description(
+            "host",
+            "app",
+            "370d336",
+            "370d336",
+            "aaa",
+            "aaa",
+            "revision",
+            Some("- New"),
+            None,
+        );
+        let body = decorate_description(
+            original.clone(),
+            "host",
+            "app",
+            "370d336",
+            "370d336",
+            "aaa",
+            "aaa",
+            Some("test.2"),
+            &changes,
+            false,
+        );
+        assert!(body.starts_with("Release test.2"));
+        assert!(body.contains("RELEASE_VERSION: test.1 -> test.2"));
+        assert!(body.contains("Changelog (test.2)"));
+        let env_only = decorate_description(
+            original, "host", "app", "370d336", "370d336", "aaa", "aaa", None, &changes, false,
+        );
+        assert!(env_only.starts_with("Environment update"));
+        assert_eq!(
+            suggestion_title("host", "app", "370d336", "370d336", false, None, true),
+            "Update host/app environment"
+        );
+        assert_eq!(
+            suggestion_title("host", "app", "old", "370d336", true, Some("test.2"), true),
+            "Release host/app test.2"
+        );
+        assert_eq!(markdown_value("`x`\n<script>"), "\\`x\\`\\n\\<script\\>");
+    }
+}
+
+#[cfg(test)]
+mod presentation_contract_tests {
+    use super::*;
+
+    #[test]
+    fn release_changelog_headers_and_fences_keep_the_top_block_only() {
+        for fence in ["```", "~~~~"] {
+            let content = format!("\n  # Kappa v1 ###\r\n## Changes\r\n{fence}md\r\n# Kappa ignored\r\n{}\r\n{fence} not a closer\r\n# still content\r\n{fence}\r\n# Kappa v0\r\nold", &fence[..2]);
+            let section = release_changelog_section(&content, "v1").unwrap().unwrap();
+            assert_eq!(
+                section,
+                content.trim_start().split("\r\n# Kappa v0").next().unwrap()
+            );
+            assert!(section.contains("# still content"));
+        }
+        assert!(
+            release_changelog_section("# App wrong\n- old\n# App v1\n- don't search", "v1")
+                .is_err()
+        );
+        assert_eq!(
+            release_changelog_section("\n- headerless\n## subsection\n# App old\n- old", "v1")
+                .unwrap()
+                .as_deref(),
+            Some("- headerless\n## subsection")
+        );
+        assert_eq!(
+            release_changelog_section("~~~\n# content\n", "v1")
+                .unwrap()
+                .as_deref(),
+            Some("~~~\n# content")
+        );
+    }
+
+    #[test]
+    fn description_keeps_badge_and_changelog_source_with_nested_fences() {
+        let excerpt =
+            "- release\n```rust\nprintln!(\"hello\");\n```\n\nChangelog:\nnot a label to replace";
+        for version in [None, Some("v[1]")] {
+            let original = merge_request_description(
+                "host",
+                "kappa",
+                "1",
+                "1",
+                "a",
+                "a",
+                "rev/1",
+                Some(excerpt),
+                Some("https://daemon///"),
+            );
+            let changes = vec![
+                EnvironmentChange {
+                    name: "NEW".into(),
+                    previous: None,
+                    proposed: "".into(),
+                },
+                EnvironmentChange {
+                    name: "EXISTING".into(),
+                    previous: Some("".into()),
+                    proposed: "`x`\n\t<y>".into(),
+                },
+            ];
+            let body = decorate_description(
+                original, "host", "kappa", "1", "1", "a", "a", version, &changes, false,
+            );
+            assert!(body.contains("[![stow convergence](https://daemon/gitlab.svg?git_hash=rev%2F1)](https://daemon/status?head_hash=rev%2F1)"));
+            assert!(body.ends_with(&format!("````markdown\n{excerpt}\n````")));
+            assert!(body.contains("- NEW: unset -> (empty)"));
+            assert!(body.contains("- EXISTING: (empty) -> \\`x\\`\\n\\t\\<y\\>"));
+            assert!(
+                body.find("Environment changes:").unwrap() < body.find("````markdown").unwrap()
+            );
+            if version.is_some() {
+                assert!(body.contains("Changelog (v\\[1\\]):"));
+            } else {
+                assert!(body.starts_with("Environment update"));
+            }
+        }
+    }
 }

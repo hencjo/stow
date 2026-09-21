@@ -17,7 +17,7 @@ mod test_support;
 mod util;
 
 use crate::app_error::AppError;
-use crate::cli::{is_version_arg, print_version, CliOptions, OperationMode};
+use crate::cli::{has_global_argument, is_version_arg, print_version, CliOptions, OperationMode};
 use crate::command::capture_command;
 use crate::daemon::serve;
 use crate::reconcile::run_reconcile_once;
@@ -38,7 +38,7 @@ fn main() {
 }
 
 fn run() -> Result<(), AppError> {
-    if env::args().skip(1).any(|arg| is_version_arg(&arg)) {
+    if has_global_argument(&env::args().skip(1).collect::<Vec<_>>(), is_version_arg) {
         print_version();
         return Ok(());
     }

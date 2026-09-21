@@ -234,7 +234,7 @@ fn build_container_spec(
     })
 }
 
-fn validate_env_name(name: &str) -> Result<(), AppError> {
+pub(crate) fn validate_env_name(name: &str) -> Result<(), AppError> {
     let mut chars = name.chars();
     let starts_validly = chars
         .next()
@@ -465,15 +465,13 @@ pub fn normalize_digest(value: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 pub fn update_manifest_image_reference(
     content: &str,
     target_container: Option<&str>,
     new_ref: &str,
 ) -> Result<ManifestImageUpdate, AppError> {
-    validate_image_reference(new_ref)?;
-    let mut root: Value = serde_yaml::from_str(content)
-        .map_err(|err| AppError::msg(format!("Failed to parse manifest YAML: {err}")))?;
-    update_multi_container_manifest(&mut root, target_container, new_ref)
+    update_manifest_suggestion(content, target_container, new_ref, &[])
 }
 
 pub fn current_manifest_image_reference(
@@ -497,47 +495,251 @@ pub fn current_manifest_daemon_base_url(content: &str) -> Option<String> {
 
 pub struct ManifestImageUpdate {
     pub rendered: String,
+    pub env_changes: Vec<EnvironmentChange>,
 }
 
-fn update_multi_container_manifest(
-    root: &mut Value,
+#[derive(Debug, PartialEq)]
+pub struct EnvironmentChange {
+    pub name: String,
+    pub previous: Option<String>,
+    pub proposed: String,
+}
+
+pub fn update_manifest_suggestion(
+    content: &str,
     target_container: Option<&str>,
     new_ref: &str,
+    assignments: &[(String, String)],
 ) -> Result<ManifestImageUpdate, AppError> {
-    let (target, _) = current_multi_container_image_reference(root, target_container)?;
-
-    let containers = root
+    use std::str::FromStr;
+    use yaml_edit::{AsYaml, SyntaxKind, YamlFile};
+    validate_image_reference(new_ref)?;
+    let mut expected: Value = serde_yaml::from_str(content)
+        .map_err(|err| AppError::msg(format!("Failed to parse manifest YAML: {err}")))?;
+    let (target, current_ref) =
+        current_multi_container_image_reference(&expected, target_container)?;
+    let containers = expected
         .get_mut("containers")
         .and_then(Value::as_sequence_mut)
         .ok_or_else(|| AppError::msg("containers must be a YAML sequence"))?;
-    let mut previous_ref = None;
-    for container in containers {
-        let Some(mapping) = container.as_mapping_mut() else {
-            continue;
-        };
-        let name = mapping_get_str(mapping, "name");
-        if name.as_deref() != Some(target.as_str()) {
-            continue;
-        }
-        let current = mapping_get_str(mapping, "image")
-            .ok_or_else(|| AppError::msg(format!("container {target} missing image")))?;
-        previous_ref = Some(current);
-        mapping.insert(
-            Value::String("image".to_string()),
-            Value::String(new_ref.to_string()),
-        );
-        break;
+    let indexes: Vec<_> = containers
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.get("name").and_then(Value::as_str) == Some(target.as_str()))
+        .map(|(i, _)| i)
+        .collect();
+    if indexes.len() != 1 {
+        return Err(AppError::msg(
+            "target container must be defined exactly once",
+        ));
     }
-    let previous_ref = previous_ref.ok_or_else(|| {
-        AppError::msg(format!(
-            "multi-container manifest does not define container {target}"
-        ))
-    })?;
-    let rendered = serde_yaml::to_string(root)
-        .map_err(|err| AppError::msg(format!("Failed to render manifest YAML: {err}")))?;
-    let _ = previous_ref;
-    let _ = target;
-    Ok(ManifestImageUpdate { rendered })
+    let index = indexes[0];
+    let selected = containers[index]
+        .as_mapping_mut()
+        .ok_or_else(|| AppError::msg("target container must be a mapping"))?;
+    let has_merges = selected.contains_key(Value::String("<<".into()))
+        || selected
+            .get(Value::String("env".into()))
+            .and_then(Value::as_mapping)
+            .is_some_and(|env| env.contains_key(Value::String("<<".into())));
+    selected.insert(Value::String("image".into()), Value::String(new_ref.into()));
+    let mut env_changes = Vec::new();
+    // Collapse repeats before comparing with the target branch, not an intermediate edit.
+    let mut final_assignments: Vec<(&str, &str)> = Vec::new();
+    for (name, value) in assignments {
+        validate_env_name(name)?;
+        if value.contains('\0') {
+            return Err(AppError::msg("environment value contains NUL"));
+        }
+        if let Some(existing) = final_assignments.iter_mut().find(|(key, _)| *key == name) {
+            existing.1 = value;
+        } else {
+            final_assignments.push((name, value));
+        }
+    }
+    if !assignments.is_empty() {
+        let env = selected
+            .entry(Value::String("env".into()))
+            .or_insert_with(|| Value::Mapping(Mapping::new()))
+            .as_mapping_mut()
+            .ok_or_else(|| AppError::msg("container.env must be a mapping"))?;
+        for (name, value) in final_assignments {
+            let key = Value::String(name.into());
+            let previous = env
+                .get(&key)
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| AppError::msg("container.env values must be strings"))
+                })
+                .transpose()?;
+            if previous.as_deref() != Some(value) {
+                env_changes.push(EnvironmentChange {
+                    name: name.into(),
+                    previous,
+                    proposed: value.into(),
+                });
+                env.insert(key, Value::String(value.into()));
+            }
+        }
+    }
+    if current_ref == new_ref && env_changes.is_empty() {
+        return Ok(ManifestImageUpdate {
+            rendered: content.into(),
+            env_changes,
+        });
+    }
+    if has_merges {
+        return Err(AppError::msg(
+            "suggestion cannot edit merge-based target containers or environment",
+        ));
+    }
+    let file = YamlFile::from_str(content)
+        .map_err(|e| AppError::msg(format!("cannot losslessly edit manifest: {e}")))?;
+    let documents: Vec<_> = file.documents().collect();
+    if documents.len() != 1 {
+        return Err(AppError::msg(
+            "manifest must contain exactly one YAML document",
+        ));
+    }
+    let document = &documents[0];
+    let root = document
+        .as_mapping()
+        .ok_or_else(|| AppError::msg("manifest must be a mapping"))?;
+    let sequence = root
+        .get_sequence("containers")
+        .ok_or_else(|| AppError::msg("containers must be a direct sequence"))?;
+    let node = sequence
+        .get(index)
+        .ok_or_else(|| AppError::msg("target container missing"))?;
+    let mapping = node
+        .as_mapping()
+        .ok_or_else(|| AppError::msg("target container must be a direct mapping"))?;
+    // Never alter a shared anchor definition or inherited values implicitly.
+    if mapping.contains_key("<<")
+        || mapping
+            .get_mapping("env")
+            .is_some_and(|env| env.contains_key("<<"))
+        || node.as_node().is_some_and(|syntax| {
+            // The item wrapper owns an anchor preceding a block mapping.
+            let syntax = syntax
+                .parent()
+                .filter(|parent| parent.kind() == SyntaxKind::SEQUENCE_ENTRY)
+                .unwrap_or_else(|| syntax.clone());
+            syntax
+                .descendants_with_tokens()
+                .filter_map(|n| n.into_token())
+                .any(|t| matches!(t.kind(), SyntaxKind::ANCHOR | SyntaxKind::REFERENCE))
+        })
+    {
+        return Err(AppError::msg(
+            "suggestion cannot edit anchored, aliased or merge-based target containers",
+        ));
+    }
+    if current_ref != new_ref {
+        set_yaml_string(mapping, "image", new_ref)?;
+    }
+    if !env_changes.is_empty() {
+        if !mapping.contains_key("env") {
+            // An empty flow map works inside either block or flow containers.
+            let empty = yaml_edit::Document::from_str("env: {}\n")
+                .map_err(|_| AppError::msg("cannot create environment mapping"))?;
+            let empty = empty
+                .as_mapping()
+                .and_then(|m| m.get("env"))
+                .ok_or_else(|| AppError::msg("cannot create environment mapping"))?;
+            mapping.set("env", empty);
+        }
+        let env = mapping
+            .get_mapping("env")
+            .ok_or_else(|| AppError::msg("container.env must be a direct mapping"))?;
+        if env.contains_key("<<") {
+            return Err(AppError::msg("container.env merges are not editable"));
+        }
+        for change in &env_changes {
+            set_yaml_string(&env, &change.name, &change.proposed)?;
+        }
+    }
+    let rendered = file.to_string();
+    let actual: Value = serde_yaml::from_str(&rendered)
+        .map_err(|e| AppError::msg(format!("edited YAML is invalid: {e}")))?;
+    if actual != expected {
+        return Err(AppError::msg(
+            "lossless edit changed unrelated values or failed to preserve string values",
+        ));
+    }
+    Ok(ManifestImageUpdate {
+        rendered,
+        env_changes,
+    })
+}
+
+fn set_yaml_string(mapping: &yaml_edit::Mapping, key: &str, value: &str) -> Result<(), AppError> {
+    use yaml_edit::{AsYaml, SyntaxKind};
+    let previous = mapping
+        .get(key)
+        .map(|node| node.to_string())
+        .unwrap_or_default();
+    let newline = if previous.ends_with("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let document = yaml_string(value, newline)?;
+    let scalar = document
+        .as_mapping()
+        .and_then(|m| m.get("value"))
+        .ok_or_else(|| AppError::msg("cannot encode environment string"))?;
+    // yaml-edit 0.3.2 drops the terminator owned by a replaced block scalar.
+    // Retain it as an entry token so the next key cannot join this value's line.
+    let terminator = scalar
+        .as_node()
+        .and_then(|node| {
+            node.ancestors()
+                .find(|node| node.kind() == SyntaxKind::MAPPING_ENTRY)
+        })
+        .and_then(|entry| entry.last_token())
+        .filter(|token| token.kind() == SyntaxKind::NEWLINE);
+    mapping.set(key, &scalar);
+    if previous.ends_with('\n') {
+        let entry = mapping
+            .entries()
+            .find(|entry| entry.key_matches(key))
+            .and_then(|entry| entry.key_node())
+            .and_then(|node| {
+                node.as_node().and_then(|node| {
+                    node.ancestors()
+                        .find(|node| node.kind() == SyntaxKind::MAPPING_ENTRY)
+                })
+            })
+            .ok_or_else(|| AppError::msg("cannot find YAML scalar entry"))?;
+        if !entry.to_string().ends_with('\n') {
+            let token =
+                terminator.ok_or_else(|| AppError::msg("cannot find YAML scalar terminator"))?;
+            token.detach();
+            let end = entry.children_with_tokens().count();
+            entry.splice_children(end..end, vec![token.into()]);
+        }
+    }
+    Ok(())
+}
+
+fn yaml_string(value: &str, newline: &str) -> Result<yaml_edit::Document, AppError> {
+    use std::str::FromStr;
+    // JSON string escaping is valid YAML and keeps booleans, empty values,
+    // punctuation and multiline assignments unambiguously literal strings.
+    let json = serde_json::to_string(value)
+        .map_err(|_| AppError::msg("cannot encode environment string"))?;
+    let mut quoted = String::new();
+    for ch in json.chars() {
+        if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+            quoted.push_str(&format!("\\u{:04x}", ch as u32));
+        } else {
+            quoted.push(ch);
+        }
+    }
+    let text = format!("value: {quoted}{newline}");
+    yaml_edit::Document::from_str(&text).map_err(|_| AppError::msg("cannot encode YAML string"))
 }
 
 fn current_multi_container_image_reference(
@@ -1014,5 +1216,310 @@ containers:
             None
         );
         assert_eq!(current_manifest_daemon_base_url("not: yaml: ["), None);
+    }
+}
+
+#[cfg(test)]
+mod suggestion_tests {
+    use super::*;
+
+    fn image(digest: char) -> String {
+        format!(
+            "registry.example/app:370d336@sha256:{}",
+            digest.to_string().repeat(64)
+        )
+    }
+
+    #[test]
+    fn image_and_env_edits_preserve_untouched_yaml_and_are_idempotent() {
+        let old = image('a');
+        let new = image('b');
+        let content = format!("# keep the preamble\ndeployment:\n  name: demo # keep\ncontainers:\n  - name: app\n    image: '{old}' # image comment\n    env:\n      OTEL_Z: 'quoted'  # keep exactly\n      RELEASE_VERSION: 'test.1'\n      OTEL_A: \"last\"\n  - name: other\n    image: {old}\n    env: {{PORT: '8080'}} # other\n");
+        let args = vec![("RELEASE_VERSION".into(), "test.2".into())];
+        let updated = update_manifest_suggestion(&content, Some("app"), &new, &args).unwrap();
+        assert_eq!(
+            updated.env_changes,
+            vec![EnvironmentChange {
+                name: "RELEASE_VERSION".into(),
+                previous: Some("test.1".into()),
+                proposed: "test.2".into()
+            }]
+        );
+        assert!(updated
+            .rendered
+            .contains("      OTEL_Z: 'quoted'  # keep exactly\n"));
+        assert!(updated.rendered.contains("      OTEL_A: \"last\"\n"));
+        assert!(updated.rendered.contains(&format!(
+            "  - name: other\n    image: {old}\n    env: {{PORT: '8080'}} # other\n"
+        )));
+        assert!(updated
+            .rendered
+            .starts_with("# keep the preamble\ndeployment:\n  name: demo # keep\n"));
+        let again =
+            update_manifest_suggestion(&updated.rendered, Some("app"), &new, &args).unwrap();
+        assert_eq!(again.rendered, updated.rendered);
+        assert!(again.env_changes.is_empty());
+    }
+
+    #[test]
+    fn env_creation_and_flow_edits_keep_literal_values_as_strings() {
+        for env in [
+            "",
+            "    env: {}\n",
+            "    env: {KEEP: 'yes'} # flow\n",
+            "    env:\n      KEEP: 'yes'\n",
+        ] {
+            let old = image('a');
+            let content = format!(
+                "deployment: {{name: demo}}\ncontainers:\n  - name: app\n    image: {old}\n{env}"
+            );
+            let values = [
+                "",
+                "true",
+                "null",
+                "12",
+                "a=b",
+                "a: b # c",
+                "one\ntwo",
+                "'\\\"{}",
+                "$HOME {{not expanded}}",
+            ];
+            let assignments: Vec<_> = values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (format!("ENV_{i}"), (*v).into()))
+                .collect();
+            let result =
+                update_manifest_suggestion(&content, Some("app"), &old, &assignments).unwrap();
+            let root: Value = serde_yaml::from_str(&result.rendered).unwrap();
+            for (name, value) in &assignments {
+                assert_eq!(
+                    root["containers"][0]["env"][name.as_str()].as_str(),
+                    Some(value.as_str())
+                );
+            }
+            if !env.is_empty() && env.contains("KEEP") {
+                assert_eq!(root["containers"][0]["env"]["KEEP"].as_str(), Some("yes"));
+            }
+        }
+    }
+
+    #[test]
+    fn no_op_preserves_bytes_and_ambiguous_or_shared_targets_fail_closed() {
+        let old = image('a');
+        let content = format!("containers: [{{name: app, image: '{old}', env: {{A: '1'}}}}]");
+        assert_eq!(
+            update_manifest_suggestion(&content, Some("app"), &old, &[("A".into(), "1".into())])
+                .unwrap()
+                .rendered,
+            content
+        );
+        for content in [
+            format!("containers:\n  - name: app\n    image: {old}\n  - name: app\n    image: {old}\n"),
+            format!("containers:\n  - name: app\n    image: {old}\n    env: &shared {{A: '1'}}\n"),
+            format!("base: &shared {{A: '1'}}\ncontainers:\n  - name: app\n    image: {old}\n    env: *shared\n"),
+        ] { assert!(update_manifest_suggestion(&content, Some("app"), &image('b'), &[("A".into(), "2".into())]).is_err()); }
+    }
+}
+
+#[cfg(test)]
+mod suggestion_contract_tests {
+    use super::*;
+
+    fn image() -> String {
+        format!("registry.example/kappa:370d336@sha256:{}", "a".repeat(64))
+    }
+
+    fn edit(raw: &str, args: &[(&str, &str)]) -> Result<ManifestImageUpdate, AppError> {
+        update_manifest_suggestion(
+            raw,
+            Some("kappa"),
+            &image(),
+            &args
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn golden_block_edit_preserves_every_unrelated_byte() {
+        let raw = format!("# Kappa deployment\ndeployment: {{name: kappa}}\ncontainers:\n  - name: kappa\n    image: '{}' # immutable\n    env:\n      OTEL_SERVICE_NAME: \"kappa\" # leave alone\n      RELEASE_VERSION: \"20260908.0\" # release\n      SOURCE_REVISION: 'built'\n", image());
+        let result = edit(&raw, &[("RELEASE_VERSION", "20260914.0")]).unwrap();
+        assert_eq!(result.rendered, raw.replace("20260908.0", "20260914.0"));
+        let manifest = build_manifest(
+            Path::new("."),
+            None,
+            &result.rendered,
+            Path::new("stow.yaml"),
+        )
+        .unwrap();
+        assert_eq!(manifest.containers[0].env["RELEASE_VERSION"], "20260914.0");
+        assert_eq!(manifest.containers[0].env["SOURCE_REVISION"], "built");
+    }
+
+    #[test]
+    fn golden_flow_edit_preserves_comments_spacing_and_other_containers() {
+        let raw = format!("deployment: {{name: kappa}}\ncontainers: [{{name: kappa, image: '{}', env: {{KEEP: 'yes', A: \"old\"}}}}, # keep\n {{name: other, image: '{}'}}]\n", image(), image());
+        assert_eq!(
+            edit(&raw, &[("A", "new")]).unwrap().rendered,
+            raw.replace("\"old\"", "\"new\"")
+        );
+    }
+
+    #[test]
+    fn scalar_styles_and_line_endings_preserve_untouched_bytes() {
+        for scalar in [
+            "'old'",
+            "\"old\"",
+            "old",
+            "|-\n        old",
+            ">- # keep-block\n        old",
+        ] {
+            for newline in ["\n", "\r\n"] {
+                let raw = format!("deployment: {{name: kappa}}\ncontainers:\n  - name: kappa\n    image: '{}'\n    env:\n      BEFORE: 'untouched' # before\n      A: {scalar}\n      AFTER: \"untouched\" # after\n", image()).replace('\n', newline);
+                let result = edit(&raw, &[("A", "new")])
+                    .unwrap_or_else(|err| panic!("scalar {scalar:?}, newline {newline:?}: {err}"));
+                let root: Value = serde_yaml::from_str(&result.rendered).unwrap();
+                assert_eq!(root["containers"][0]["env"]["A"].as_str(), Some("new"));
+                assert!(result
+                    .rendered
+                    .contains(&format!("      BEFORE: 'untouched' # before{newline}")));
+                assert!(result
+                    .rendered
+                    .contains(&format!("      AFTER: \"untouched\" # after{newline}")));
+                if scalar.contains("# keep-block") {
+                    assert!(result.rendered.contains("# keep-block"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn final_assignment_only_determines_changes_and_order() {
+        let raw = format!(
+            "containers: [{{name: kappa, image: '{}', env: {{A: 'old', B: 'old'}}}}]\n",
+            image()
+        );
+        let unchanged = edit(&raw, &[("A", "changed"), ("A", "old")]).unwrap();
+        assert_eq!(unchanged.rendered, raw);
+        assert!(unchanged.env_changes.is_empty());
+        let changed = edit(
+            &raw,
+            &[
+                ("B", "intermediate"),
+                ("A", "new-a"),
+                ("B", "new-b"),
+                ("C", ""),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            changed
+                .env_changes
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["B", "A", "C"]
+        );
+        assert_eq!(changed.env_changes[0].previous.as_deref(), Some("old"));
+        assert_eq!(changed.env_changes[0].proposed, "new-b");
+        assert_eq!(changed.env_changes[2].previous, None);
+    }
+
+    #[test]
+    fn strings_round_trip_including_unicode_line_breaks_and_controls() {
+        let raw = format!("containers: [{{name: kappa, image: '{}'}}]\n", image());
+        let values = [
+            "",
+            "true",
+            "8080",
+            "null",
+            "  spaced  ",
+            "a=b=c",
+            "$HOME {{literal}}",
+            "Å字🦀",
+            "a\nb\r\nc\t",
+            "\u{85}\u{2028}\u{2029}",
+            "\u{1}\u{1b}\u{7f}",
+            "quotes: '\"\\",
+        ];
+        for value in values {
+            let result = edit(&raw, &[("A", value)]).unwrap();
+            let root: Value = serde_yaml::from_str(&result.rendered).unwrap();
+            assert_eq!(root["containers"][0]["env"]["A"].as_str(), Some(value));
+            assert_eq!(
+                edit(&result.rendered, &[("A", value)]).unwrap().rendered,
+                result.rendered
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_yaml_targets_and_replaced_values_fail_closed() {
+        let image = image();
+        for raw in [
+            format!("containers: [{{name: kappa, image: '{image}', env: {{A: 1}}}}]"),
+            format!("containers: [{{name: kappa, image: '{image}', env: {{A: true}}}}]"),
+            format!("containers: [{{name: kappa, image: '{image}', env: {{A: null}}}}]"),
+            format!("containers: [{{name: kappa, image: '{image}', env: []}}]"),
+            format!("containers: [{{name: kappa, image: '{image}', env: null}}]"),
+            format!("containers: [{{name: kappa, image: '{image}', env: {{A: 'x', A: 'y'}}}}]"),
+            format!("containers: [{{name: kappa, image: '{image}', image: '{image}'}}]"),
+            format!("containers: [{{name: kappa, image: '{image}'}}, {{name: kappa, image: '{image}'}}]"),
+            format!("containers: [{{name: kappa, image: '{image}'}}]\n---\nother: doc"),
+            "containers: [{name: kappa}]".into(),
+            "containers: {name: kappa}".into(),
+        ] {
+            assert!(edit(&raw, &[("A", "new")]).is_err(), "accepted {raw}");
+        }
+    }
+
+    #[test]
+    fn anchors_and_merges_fail_only_when_mutation_is_required() {
+        for extra in [
+            "env: &shared {A: 'old'}",
+            "args: [&shared value]",
+            "env: {<<: {A: old}}",
+            "<<: {memory: 1g}",
+        ] {
+            let raw = format!(
+                "containers:\n  - name: kappa\n    image: '{}'\n    {extra}\n",
+                image()
+            );
+            assert_eq!(edit(&raw, &[]).unwrap().rendered, raw);
+            assert!(edit(&raw, &[("A", "new")]).is_err(), "accepted {raw}");
+            // Env merges are unsafe for image-only edits too.
+            assert!(update_manifest_suggestion(
+                &raw,
+                Some("kappa"),
+                &image().replace(":370d336", ":new"),
+                &[]
+            )
+            .is_err());
+        }
+        let anchored = format!(
+            "containers:\n  - &shared\n    name: kappa\n    image: '{}'\n",
+            image()
+        );
+        assert!(edit(&anchored, &[("A", "new")]).is_err());
+        let flow_anchor = format!(
+            "containers: [&shared {{name: kappa, image: '{}'}}]\n",
+            image()
+        );
+        assert!(edit(&flow_anchor, &[("A", "new")]).is_err());
+        let unrelated = format!("other: &shared hello\ncontainers:\n  - name: kappa\n    image: '{}'\n  - name: other\n    image: '{}'\n    args: [*shared]\n", image(), image());
+        assert!(edit(&unrelated, &[("A", "new")]).is_ok());
+    }
+
+    #[test]
+    fn post_edit_semantic_check_rejects_changes_to_an_external_alias_consumer() {
+        let raw = format!(
+            "containers: &all\n  - name: kappa\n    image: '{}'\nmirror: *all\n",
+            image()
+        );
+        assert_eq!(edit(&raw, &[]).unwrap().rendered, raw);
+        let error = edit(&raw, &[("A", "new")]).err().unwrap().to_string();
+        assert!(error.contains("changed unrelated values"), "{error}");
     }
 }

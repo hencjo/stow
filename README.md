@@ -7,7 +7,7 @@ It is deliberately small: GitLab merge requests are the change-control flow, and
 The usual workflow is:
 
 1. An application pipeline builds and pushes a Docker image.
-2. `stow suggest-image` opens or updates a GitLab merge request that pins the new image digest in the deployment repo.
+2. `stow suggest-image` opens or updates a GitLab merge request that pins the image digest and optional environment changes in the deployment repo.
 3. After the MR is merged, a deployment-repo pipeline calls the host daemon.
 4. `stow daemon` reconciles the Docker host to the latest default-branch HEAD.
 
@@ -15,14 +15,14 @@ In OTF-style terms, `stow` treats services as code: declarative service descript
 
 ## suggest-image
 
-`suggest-image` is the image-bump mode. It is meant to run from the application build pipeline after a successful Docker build.
+`suggest-image` proposes image and environment updates from the application build pipeline after a successful Docker build. It neither merges nor deploys them.
 
 It:
 
 - reads the target deployment repo through the GitLab API
-- loads `<subfolder>/stow.yaml`
-- replaces the selected container image with the new image digest
-- force-updates a fresh `suggest/...` branch from current default branch
+- loads `<subfolder>/stow.yaml` at the default branch's captured commit SHA
+- edits only the selected image and requested environment values, preserving unrelated YAML bytes
+- commits both changes atomically on the stable `suggest/...` branch, based on that SHA
 - creates or updates a merge request
 - sets the MR source branch to delete on merge
 - adds a linked convergence badge if `deployment.daemonBaseUrl` exists in `stow.yaml`
@@ -50,16 +50,114 @@ Required:
 - `--project`
 - `--subfolder`
 - `--image`
+- `--container`; explicit even for a single-container manifest
 
 Optional:
 
 - `--digest`; if omitted, `stow` asks Docker for the digest
-- `--container`; target container name (required)
 - `--assign`; comma-separated MR assignment attempts, tried in order:
   `gitlab_user_id`, `id:<gitlab-user-id>`, `user:<gitlab-username>`
-- `--changelog-file`; adds only the added markdown lines between old and new image tags
+- `--env NAME=VALUE`; repeatable literal environment assignments
+- `--release-version STRING`; display version, independent of the image tag and environment
+- `--changelog-file`; local changelog path relative to the caller's working directory
 
 `--digest` must be the registry manifest digest. Use the `digest: sha256:...` line from `docker push`; Docker image IDs are local image/config digests rather than pullable registry manifest digests.
+
+Digests contain exactly 64 hexadecimal digits, optionally prefixed with `sha256:`,
+and are normalized to lowercase. With `--digest`, no Docker or registry access is
+needed. Without it, the existing Docker manifest-inspect/pull/inspect workflow applies.
+Nonblank `GITLAB_ACCESS_TOKEN` takes precedence over `CI_JOB_TOKEN`; tokens are
+trimmed. The fallback token still needs permission for the GitLab operations.
+`suggest-image` does not accept `--config` and never contacts a host.
+
+### Release and environment suggestions
+
+Run this from the application's CI checkout (`stow-suggest` is the CI job name,
+not another executable):
+
+```sh
+stow suggest-image \
+  --project sigma/sigma-team-deployments \
+  --subfolder abpm-0001.ext.tele2.com \
+  --container kappa \
+  --image nexus.int.tele2.com:18443/kappa/kappa:370d336 \
+  --digest "$IMAGE_DIGEST" \
+  --release-version 20260914.0 \
+  --env RELEASE_VERSION=20260914.0 \
+  --changelog-file kappa/CHANGELOG.md \
+  --assign gitlab_user_id,user:henrsjos
+```
+
+`--env` splits at the first `=`. Names match `[A-Za-z_][A-Za-z0-9_]*`; values
+preserve whitespace, extra `=`, Unicode, newlines and empty strings. NUL is
+rejected. No shell, variable or template expansion occurs in Stow; quote values
+in the calling shell, for example `--env 'LABEL=$HOME {{literal}}'`.
+Repeated names use the last value while retaining their first argument position.
+`--env EMPTY=` sets an empty string; there is no unset operation. Unspecified keys
+remain untouched. **These values appear in Git and MR descriptions: this is not
+a secret channel.** Keep using the existing secret-file mechanism for secrets.
+
+`--release-version` accepts a nonblank display string without control characters;
+the last supplied version wins. It does not set `RELEASE_VERSION`, change
+`SOURCE_REVISION`, or build, retag or promote an image. Supply the environment
+assignment separately. Its presence treats image tags as opaque and bypasses
+numeric downgrade checks, even for numeric tags. Without it, the existing numeric
+and git-describe checks still apply; `--env` alone does not bypass them.
+
+With `--release-version`, the changelog quoted in the merge request is taken from
+`--changelog-file` as the section for that version: the entries under a leading
+`# Unreleased` heading (the gitlab/release.sh format, where those entries become the
+release on promotion; the heading itself is not quoted), a headerless top block, or
+a top heading ending in the version. Any other top heading is reported and skipped.
+
+An environment-only suggestion still supplies the current `--image` and normally
+its `--digest`. Existing 0.2 hosts consume the resulting manifest unchanged.
+Real edits involving anchors/aliases anywhere in the selected container, or
+container/environment merge keys, fail closed. Block and flow mappings are
+supported; replaced env values must already be strings. Unrelated anchored
+containers do not prevent an edit. Semantic no-ops preserve the original bytes.
+
+### Changelogs and retries
+
+Without a release version, different tags select added lines from local
+`git diff --no-ext-diff --find-renames --unified=0 <old-tag>..<new-tag> -- <path>`.
+Equal tags skip this changelog lookup. With a release version, Stow reads the
+local file's top block: a first `# ` heading must end in the exact version token
+(optional closing `#` markers are ignored), or the block may be headerless.
+The next `# ` heading ends the block; `##` subsections and headings inside
+backtick/tilde code fences do not. A mismatched heading is not searched past.
+Missing files/refs, empty files and mismatches produce diagnostics, not failed
+suggestions. The excerpt is shown as Markdown source; the file is never changed.
+
+Already-matching image and final env values produce no commit or MR, even with a
+different display version. This path does not close stale MRs. Identical pending
+manifest bytes reuse their commit, and an open MR is updated rather than duplicated.
+A commit may succeed before the MR request fails; rerun the same command safely.
+If the target head moves during preparation, Stow fails with
+`target branch changed while preparing suggestion; retry` before writing.
+The recheck is best effort, not a lock or compare-and-swap guarantee.
+
+Suggestion branches are automation-owned. Their name is `suggest/` followed by
+`<subfolder>-<container>`, replacing every character outside ASCII letters,
+digits, `-`, `_`, and `.` with `-`. Every proposal starts from the default branch,
+not the previous suggestion: replacement can discard pending/manual edits.
+Concurrent writers and sanitized-name collisions share a last-writer-wins branch.
+Serialize CI jobs for each target/container when every suggestion must survive.
+Image and environment updates share one file revision, commit and MR; the GitLab
+API calls themselves are not a transaction.
+
+### Pre-release compatibility gate
+
+The source baseline is `stow-v0.2.2` (`0a7ba7d`), whose tree matches the starting
+`main` (`8c62316`). Local tests cover the old loader, deployment hashing and Docker
+environment handoff. Before releasing 0.3, confirm the actual deployed binary's
+source, replay the consuming CI invocation with representative deployed manifests
+against a scratch GitLab project, then merge and reconcile on that 0.2 host.
+Verify idempotency before and after merge and confirm Kappa receives the release
+version without overriding its image-built source revision. This live gate is
+separate from local tests; no configuration migration or host upgrade is intended.
+
+### Convergence badges
 
 Put the daemon URL in the target `stow.yaml`:
 
