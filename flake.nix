@@ -27,6 +27,8 @@
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
 
+            nativeCheckInputs = [ pkgs.git ];
+
             CARGO_BUILD_TARGET = pkgs.stdenv.hostPlatform.rust.rustcTargetSpec;
           };
 
