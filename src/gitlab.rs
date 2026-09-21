@@ -67,6 +67,8 @@ pub struct GitLabCommitRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub force: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_commit_id: Option<String>,
@@ -284,9 +286,9 @@ impl<'a> GitLabClient<'a> {
 
 fn map_ureq_error(err: UreqError, context: &str) -> AppError {
     match err {
-        UreqError::Status(code, response) => {
-            let body = response.into_string().unwrap_or_default();
-            AppError::msg(format!("{context}: HTTP {code}: {body}"))
+        UreqError::Status(code, _) => {
+            // GitLab/proxies may echo submitted YAML, MR content or credentials.
+            AppError::msg(format!("{context}: HTTP {code}"))
         }
         UreqError::Transport(transport) => {
             AppError::msg(format!("{context}: transport error: {}", transport))
