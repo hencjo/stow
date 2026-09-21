@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is managed by [release-plz](https://release-plz.dev/) from Conventional Commits.
 
+## [0.2.3](https://github.com/hencjo/stow/compare/stow-v0.2.2...stow-v0.2.3) - 2026-09-21
+
+### Added
+
+- add compatible image and environment suggestions
+
+### Other
+
+- missed dependency
+
 ## [0.2.2](https://github.com/hencjo/stow/compare/stow-v0.2.1...stow-v0.2.2) - 2026-09-08
 
 ### Fixed
