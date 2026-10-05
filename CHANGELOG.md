@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is managed by [release-plz](https://release-plz.dev/) from Conventional Commits.
 
+## [0.2.4](https://github.com/hencjo/stow/compare/stow-v0.2.3...stow-v0.2.4) - 2026-10-05
+
+### Other
+
+- replace internal service names with neutral examples
+
 ## [0.2.3](https://github.com/hencjo/stow/compare/stow-v0.2.2...stow-v0.2.3) - 2026-09-21
 
 ### Added
