@@ -1133,7 +1133,11 @@ mod presentation_contract_tests {
             let section = release_changelog_section(&content, "v1").unwrap().unwrap();
             assert_eq!(
                 section,
-                content.trim_start().split("\r\n# Webapp v0").next().unwrap()
+                content
+                    .trim_start()
+                    .split("\r\n# Webapp v0")
+                    .next()
+                    .unwrap()
             );
             assert!(section.contains("# still content"));
         }
